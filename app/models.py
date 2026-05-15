@@ -830,3 +830,144 @@ class EmployeeDocument(Base, TimestampMixin):
 
     def __repr__(self) -> str:
         return f"<EmployeeDocument {self.doc_type} emp={self.employee_id}>"
+
+
+# ─── HRIS H2 Enumerations ─────────────────────────────────────────────────────
+
+class AttendanceSource(str, enum.Enum):
+    MANUAL       = "manual"
+    MOBILE       = "mobile"        # geolocation + selfie clock-in
+    FINGERPRINT  = "fingerprint"
+    IMPORT       = "import"
+
+
+class LeaveRequestStatus(str, enum.Enum):
+    DRAFT     = "draft"
+    SUBMITTED = "submitted"
+    APPROVED  = "approved"
+    REJECTED  = "rejected"
+
+
+# ─── AttendanceRecord ─────────────────────────────────────────────────────────
+
+class AttendanceRecord(Base, TimestampMixin):
+    __tablename__ = "hris_attendance_records"
+
+    id:                     Mapped[int]              = mapped_column(Integer, primary_key=True)
+    employee_id:            Mapped[int]              = mapped_column(ForeignKey("hris_employees.id"), nullable=False, index=True)
+    date:                   Mapped[date]             = mapped_column(Date, nullable=False)
+    clock_in:               Mapped[datetime|None]    = mapped_column(DateTime(timezone=True), nullable=True)
+    clock_out:              Mapped[datetime|None]    = mapped_column(DateTime(timezone=True), nullable=True)
+    hours_regular:          Mapped[Decimal|None]     = mapped_column(Numeric(5, 2), nullable=True)
+    hours_overtime_weekday: Mapped[Decimal|None]     = mapped_column(Numeric(5, 2), nullable=True)
+    hours_overtime_weekend: Mapped[Decimal|None]     = mapped_column(Numeric(5, 2), nullable=True)
+    hours_overtime_holiday: Mapped[Decimal|None]     = mapped_column(Numeric(5, 2), nullable=True)
+    source:                 Mapped[AttendanceSource] = mapped_column(
+        SAEnum(AttendanceSource, values_callable=lambda x: [e.value for e in x]),
+        nullable=False, default=AttendanceSource.MANUAL
+    )
+    # Geolocation (clock-in)
+    latitude:               Mapped[Decimal|None]     = mapped_column(Numeric(9, 6), nullable=True)
+    longitude:              Mapped[Decimal|None]     = mapped_column(Numeric(9, 6), nullable=True)
+    accuracy:               Mapped[Decimal|None]     = mapped_column(Numeric(10, 2), nullable=True)  # metres
+    # Selfie / face verification
+    selfie_url:             Mapped[str|None]         = mapped_column(String(500), nullable=True)
+    face_verified:          Mapped[bool]             = mapped_column(Boolean, nullable=False, default=False)
+    face_confidence:        Mapped[Decimal|None]     = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
+    note:                   Mapped[str|None]         = mapped_column(Text, nullable=True)
+
+    employee: Mapped["Employee"] = relationship("Employee", foreign_keys=[employee_id])
+
+    __table_args__ = (
+        UniqueConstraint("employee_id", "date", name="uq_attendance_emp_date"),
+        Index("ix_attendance_date",     "date"),
+        Index("ix_attendance_employee", "employee_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AttendanceRecord emp={self.employee_id} date={self.date}>"
+
+
+# ─── LeaveType ────────────────────────────────────────────────────────────────
+
+class LeaveType(Base, TimestampMixin):
+    __tablename__ = "hris_leave_types"
+
+    id:                  Mapped[int]      = mapped_column(Integer, primary_key=True)
+    code:                Mapped[str]      = mapped_column(String(50), unique=True, nullable=False, index=True)
+    name:                Mapped[str]      = mapped_column(String(255), nullable=False)
+    max_days_per_year:   Mapped[int|None] = mapped_column(Integer, nullable=True)   # null = unlimited
+    is_paid:             Mapped[bool]     = mapped_column(Boolean, nullable=False, default=True)
+    requires_approval:   Mapped[bool]     = mapped_column(Boolean, nullable=False, default=True)
+    is_active:           Mapped[bool]     = mapped_column(Boolean, nullable=False, default=True)
+
+    balances:  Mapped[list["LeaveBalance"]]  = relationship("LeaveBalance",  back_populates="leave_type")
+    requests:  Mapped[list["LeaveRequest"]]  = relationship("LeaveRequest",  back_populates="leave_type")
+
+    def __repr__(self) -> str:
+        return f"<LeaveType {self.code}>"
+
+
+# ─── LeaveBalance ─────────────────────────────────────────────────────────────
+
+class LeaveBalance(Base, TimestampMixin):
+    __tablename__ = "hris_leave_balances"
+
+    id:            Mapped[int] = mapped_column(Integer, primary_key=True)
+    employee_id:   Mapped[int] = mapped_column(ForeignKey("hris_employees.id"), nullable=False, index=True)
+    leave_type_id: Mapped[int] = mapped_column(ForeignKey("hris_leave_types.id"), nullable=False, index=True)
+    year:          Mapped[int] = mapped_column(Integer, nullable=False)
+    accrued:       Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # days granted
+    used:          Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # days taken
+
+    employee:   Mapped["Employee"]  = relationship("Employee",  foreign_keys=[employee_id])
+    leave_type: Mapped["LeaveType"] = relationship("LeaveType", back_populates="balances")
+
+    __table_args__ = (
+        UniqueConstraint("employee_id", "leave_type_id", "year", name="uq_leave_balance"),
+        Index("ix_leave_balance_emp_year", "employee_id", "year"),
+    )
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.accrued - self.used)
+
+    def __repr__(self) -> str:
+        return f"<LeaveBalance emp={self.employee_id} type={self.leave_type_id} year={self.year}>"
+
+
+# ─── LeaveRequest ─────────────────────────────────────────────────────────────
+
+class LeaveRequest(Base, TimestampMixin):
+    __tablename__ = "hris_leave_requests"
+
+    id:                    Mapped[int]               = mapped_column(Integer, primary_key=True)
+    employee_id:           Mapped[int]               = mapped_column(ForeignKey("hris_employees.id"), nullable=False, index=True)
+    leave_type_id:         Mapped[int]               = mapped_column(ForeignKey("hris_leave_types.id"), nullable=False)
+    start_date:            Mapped[date]              = mapped_column(Date, nullable=False)
+    end_date:              Mapped[date]              = mapped_column(Date, nullable=False)
+    days:                  Mapped[int]               = mapped_column(Integer, nullable=False)
+    reason:                Mapped[str|None]          = mapped_column(Text, nullable=True)
+    status:                Mapped[LeaveRequestStatus] = mapped_column(
+        SAEnum(LeaveRequestStatus, values_callable=lambda x: [e.value for e in x]),
+        nullable=False, default=LeaveRequestStatus.DRAFT
+    )
+    approval_chain:        Mapped[list|None]         = mapped_column(JSONB, nullable=True, default=list)
+    approval_step:         Mapped[int]               = mapped_column(Integer, nullable=False, default=0)
+    current_approver_role: Mapped[str|None]          = mapped_column(String(50), nullable=True)
+    approval_history:      Mapped[list|None]         = mapped_column(JSONB, nullable=True, default=list)
+    submitted_by:          Mapped[int]               = mapped_column(ForeignKey("users.id"), nullable=False)
+    approved_by:           Mapped[int|None]          = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    employee:   Mapped["Employee"]   = relationship("Employee",  foreign_keys=[employee_id])
+    leave_type: Mapped["LeaveType"]  = relationship("LeaveType", back_populates="requests")
+    submitter:  Mapped["User"]       = relationship("User", foreign_keys=[submitted_by])
+    approver:   Mapped["User|None"]  = relationship("User", foreign_keys=[approved_by])
+
+    __table_args__ = (
+        Index("ix_leave_requests_emp",    "employee_id"),
+        Index("ix_leave_requests_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<LeaveRequest emp={self.employee_id} {self.start_date}–{self.end_date}>"

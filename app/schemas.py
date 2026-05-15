@@ -16,6 +16,7 @@ from app.models import (
     ARStatus, CostCodeCategory, DocStatus, DocType,
     ExpenseStatus, ItemCategory, PettyCashReportStatus, ProjectStatus, RoleName, TxnType,
     EmpDocType, EmployeeStatus, EmploymentType,
+    AttendanceSource, LeaveRequestStatus,
 )
 
 
@@ -756,3 +757,128 @@ class EmployeeResponse(ORMBase):
     documents:    list[EmployeeDocumentResponse] = []
     created_at:   datetime
     updated_at:   datetime
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HRIS Schemas — Phase H2: Absensi & Cuti
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Attendance ──────────────────────────────────────────────────────────────
+
+class AttendanceRecordResponse(ORMBase):
+    id:                     int
+    employee_id:            int
+    date:                   date
+    clock_in:               datetime | None
+    clock_out:              datetime | None
+    hours_regular:          Decimal | None
+    hours_overtime_weekday: Decimal | None
+    hours_overtime_weekend: Decimal | None
+    hours_overtime_holiday: Decimal | None
+    source:                 AttendanceSource
+    latitude:               Decimal | None
+    longitude:              Decimal | None
+    accuracy:               Decimal | None
+    selfie_url:             str | None
+    face_verified:          bool
+    face_confidence:        Decimal | None
+    note:                   str | None
+    created_at:             datetime
+    updated_at:             datetime
+
+
+class AttendanceManualCreate(BaseModel):
+    employee_id:            int
+    date:                   date
+    clock_in:               datetime | None = None
+    clock_out:              datetime | None = None
+    hours_regular:          Decimal | None  = None
+    hours_overtime_weekday: Decimal | None  = None
+    hours_overtime_weekend: Decimal | None  = None
+    hours_overtime_holiday: Decimal | None  = None
+    note:                   str | None      = None
+
+
+class AttendanceSummaryItem(ORMBase):
+    employee_id:   int
+    employee_no:   str
+    full_name:     str
+    days_present:  int
+    hours_regular: Decimal
+    hours_ot_total: Decimal
+
+
+# ─── Leave Types ─────────────────────────────────────────────────────────────
+
+class LeaveTypeCreate(BaseModel):
+    code:               str  = Field(min_length=1, max_length=50)
+    name:               str  = Field(min_length=1, max_length=255)
+    max_days_per_year:  int | None = Field(None, ge=1)
+    is_paid:            bool = True
+    requires_approval:  bool = True
+    is_active:          bool = True
+
+
+class LeaveTypeResponse(ORMBase):
+    id:                 int
+    code:               str
+    name:               str
+    max_days_per_year:  int | None
+    is_paid:            bool
+    requires_approval:  bool
+    is_active:          bool
+    created_at:         datetime
+
+
+# ─── Leave Balance ───────────────────────────────────────────────────────────
+
+class LeaveBalanceResponse(ORMBase):
+    id:            int
+    employee_id:   int
+    leave_type_id: int
+    year:          int
+    accrued:       int
+    used:          int
+    remaining:     int
+    leave_type:    LeaveTypeResponse
+
+
+# ─── Leave Request ───────────────────────────────────────────────────────────
+
+class LeaveRequestCreate(BaseModel):
+    employee_id:   int
+    leave_type_id: int
+    start_date:    date
+    end_date:      date
+    reason:        str | None = None
+
+    @model_validator(mode="after")
+    def check_dates(self) -> "LeaveRequestCreate":
+        if self.end_date < self.start_date:
+            raise ValueError("end_date must be >= start_date")
+        return self
+
+
+class LeaveActionRequest(BaseModel):
+    note: str | None = None
+
+
+class LeaveRequestResponse(ORMBase):
+    id:                    int
+    employee_id:           int
+    leave_type_id:         int
+    start_date:            date
+    end_date:              date
+    days:                  int
+    reason:                str | None
+    status:                LeaveRequestStatus
+    approval_chain:        list | None
+    approval_step:         int
+    current_approver_role: str | None
+    approval_history:      list | None
+    submitted_by:          int
+    approved_by:           int | None
+    leave_type:            LeaveTypeResponse
+    employee:              EmployeeResponse | None = None
+    created_at:            datetime
+    updated_at:            datetime
