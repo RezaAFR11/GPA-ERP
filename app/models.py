@@ -800,6 +800,9 @@ class Employee(Base, TimestampMixin):
     documents:  Mapped[list["EmployeeDocument"]] = relationship(
         "EmployeeDocument", back_populates="employee", cascade="all, delete-orphan"
     )
+    salary_assignments: Mapped[list["SalaryAssignment"]] = relationship(
+        "SalaryAssignment", back_populates="employee"
+    )
 
     __table_args__ = (
         Index("ix_hris_employees_dept",   "dept_id"),
@@ -971,3 +974,264 @@ class LeaveRequest(Base, TimestampMixin):
 
     def __repr__(self) -> str:
         return f"<LeaveRequest emp={self.employee_id} {self.start_date}–{self.end_date}>"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HRIS — Phase H3: Payroll
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SalaryComponentType(str, enum.Enum):
+    BASIC      = "BASIC"
+    ALLOWANCE  = "ALLOWANCE"
+    DEDUCTION  = "DEDUCTION"
+    BPJS       = "BPJS"
+    TAX        = "TAX"
+
+
+class PayrollStatus(str, enum.Enum):
+    OPEN   = "OPEN"
+    LOCKED = "LOCKED"
+    POSTED = "POSTED"
+
+
+class PPh21Method(str, enum.Enum):
+    GROSS_UP = "GROSS_UP"
+    NETTO    = "NETTO"
+
+
+class SalaryComponent(Base, TimestampMixin):
+    """Reusable salary line (basic, allowance, deduction, BPJS, tax)."""
+    __tablename__ = "hris_salary_components"
+
+    id:             Mapped[int]                = mapped_column(Integer, primary_key=True)
+    code:           Mapped[str]                = mapped_column(String(20),  unique=True, nullable=False)
+    name:           Mapped[str]                = mapped_column(String(100), nullable=False)
+    component_type: Mapped[SalaryComponentType] = mapped_column(
+        SAEnum(SalaryComponentType, values_callable=lambda x: [e.value for e in x]),
+        nullable=False,
+    )
+    is_taxable:     Mapped[bool]               = mapped_column(Boolean, nullable=False, default=True)
+    is_active:      Mapped[bool]               = mapped_column(Boolean, nullable=False, default=True)
+
+    assignments: Mapped[list["SalaryAssignment"]] = relationship("SalaryAssignment", back_populates="component")
+
+    def __repr__(self) -> str:
+        return f"<SalaryComponent {self.code}>"
+
+
+class SalaryAssignment(Base, TimestampMixin):
+    """Per-employee salary structure line."""
+    __tablename__ = "hris_salary_assignments"
+
+    id:             Mapped[int]             = mapped_column(Integer, primary_key=True)
+    employee_id:    Mapped[int]             = mapped_column(ForeignKey("hris_employees.id"), nullable=False, index=True)
+    component_id:   Mapped[int]             = mapped_column(ForeignKey("hris_salary_components.id"), nullable=False)
+    amount:         Mapped[Decimal]         = mapped_column(Numeric(18, 2), nullable=False)
+    effective_from: Mapped[date]            = mapped_column(Date, nullable=False)
+    effective_to:   Mapped[date|None]       = mapped_column(Date, nullable=True)
+
+    employee:  Mapped["Employee"]        = relationship("Employee", back_populates="salary_assignments")
+    component: Mapped["SalaryComponent"] = relationship("SalaryComponent", back_populates="assignments")
+
+    def __repr__(self) -> str:
+        return f"<SalaryAssignment emp={self.employee_id} comp={self.component_id}>"
+
+
+class PayrollPeriod(Base, TimestampMixin):
+    """Monthly payroll period (OPEN → LOCKED → POSTED)."""
+    __tablename__ = "hris_payroll_periods"
+
+    id:        Mapped[int]            = mapped_column(Integer, primary_key=True)
+    year:      Mapped[int]            = mapped_column(Integer, nullable=False)
+    month:     Mapped[int]            = mapped_column(Integer, nullable=False)
+    status:    Mapped[PayrollStatus]  = mapped_column(
+        SAEnum(PayrollStatus, values_callable=lambda x: [e.value for e in x]),
+        nullable=False, default=PayrollStatus.OPEN,
+    )
+    locked_at: Mapped[datetime|None]  = mapped_column(DateTime(timezone=True), nullable=True)
+    locked_by: Mapped[int|None]       = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    runs:    Mapped[list["PayrollRun"]] = relationship("PayrollRun", back_populates="period")
+    locker:  Mapped["User|None"]        = relationship("User")
+
+    __table_args__ = (UniqueConstraint("year", "month", name="uq_payroll_period_ym"),)
+
+    def __repr__(self) -> str:
+        return f"<PayrollPeriod {self.year}-{self.month:02d} {self.status}>"
+
+
+class PayrollRun(Base, TimestampMixin):
+    """Per-employee calculation result for a payroll period."""
+    __tablename__ = "hris_payroll_runs"
+
+    id:                  Mapped[int]           = mapped_column(Integer, primary_key=True)
+    period_id:           Mapped[int]           = mapped_column(ForeignKey("hris_payroll_periods.id"), nullable=False, index=True)
+    employee_id:         Mapped[int]           = mapped_column(ForeignKey("hris_employees.id"),       nullable=False, index=True)
+    gross_salary:        Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    bpjs_tk_employee:    Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    bpjs_tk_employer:    Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    bpjs_kes_employee:   Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    bpjs_kes_employer:   Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    pph21_amount:        Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    pph21_method:        Mapped[PPh21Method]   = mapped_column(
+        SAEnum(PPh21Method, values_callable=lambda x: [e.value for e in x]),
+        nullable=False, default=PPh21Method.NETTO,
+    )
+    net_salary:          Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    thr_amount:          Mapped[Decimal|None]  = mapped_column(Numeric(18, 2), nullable=True)
+    components_snapshot: Mapped[dict|None]     = mapped_column(JSONB, nullable=True)
+    cost_centre_id:      Mapped[int|None]      = mapped_column(ForeignKey("cost_centres.id"), nullable=True)
+    expense_id:          Mapped[int|None]      = mapped_column(ForeignKey("expenses.id"), nullable=True)
+
+    period:    Mapped["PayrollPeriod"] = relationship("PayrollPeriod", back_populates="runs")
+    employee:  Mapped["Employee"]      = relationship("Employee")
+    payslip:   Mapped["PaySlip|None"]  = relationship("PaySlip", back_populates="run", uselist=False)
+
+    __table_args__ = (UniqueConstraint("period_id", "employee_id", name="uq_payroll_run_period_emp"),)
+
+    def __repr__(self) -> str:
+        return f"<PayrollRun period={self.period_id} emp={self.employee_id}>"
+
+
+class PaySlip(Base, TimestampMixin):
+    """Generated PDF pay slip for a payroll run."""
+    __tablename__ = "hris_payslips"
+
+    id:           Mapped[int]       = mapped_column(Integer, primary_key=True)
+    run_id:       Mapped[int]       = mapped_column(ForeignKey("hris_payroll_runs.id"), unique=True, nullable=False)
+    pdf_url:      Mapped[str]       = mapped_column(String(500), nullable=False)
+    generated_at: Mapped[datetime]  = mapped_column(DateTime(timezone=True), nullable=False)
+
+    run: Mapped["PayrollRun"] = relationship("PayrollRun", back_populates="payslip")
+
+    def __repr__(self) -> str:
+        return f"<PaySlip run={self.run_id}>"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HRIS — Phase H4: Rekrutmen & Onboarding
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PostingStatus(str, enum.Enum):
+    OPEN     = "OPEN"
+    CLOSED   = "CLOSED"
+    ON_HOLD  = "ON_HOLD"
+
+
+class ApplicantStage(str, enum.Enum):
+    RECEIVED    = "RECEIVED"
+    SCREENING   = "SCREENING"
+    INTERVIEW   = "INTERVIEW"
+    OFFER       = "OFFER"
+    HIRED       = "HIRED"
+    REJECTED    = "REJECTED"
+
+
+class ApplicantSource(str, enum.Enum):
+    JOBSTREET = "JOBSTREET"
+    LINKEDIN  = "LINKEDIN"
+    REFERRAL  = "REFERRAL"
+    WALK_IN   = "WALK_IN"
+    OTHER     = "OTHER"
+
+
+class InterviewResult(str, enum.Enum):
+    PENDING = "PENDING"
+    PASS    = "PASS"
+    FAIL    = "FAIL"
+    HOLD    = "HOLD"
+
+
+class JobPosting(Base, TimestampMixin):
+    """Open job requisition."""
+    __tablename__ = "hris_job_postings"
+
+    id:            Mapped[int]           = mapped_column(Integer, primary_key=True)
+    title:         Mapped[str]           = mapped_column(String(200), nullable=False)
+    department_id: Mapped[int|None]      = mapped_column(ForeignKey("hris_departments.id"), nullable=True)
+    grade_id:      Mapped[int|None]      = mapped_column(ForeignKey("hris_job_grades.id"),  nullable=True)
+    description:   Mapped[str|None]      = mapped_column(Text, nullable=True)
+    requirements:  Mapped[str|None]      = mapped_column(Text, nullable=True)
+    status:        Mapped[PostingStatus] = mapped_column(
+        SAEnum(PostingStatus, values_callable=lambda x: [e.value for e in x]),
+        nullable=False, default=PostingStatus.OPEN,
+    )
+    opened_at:     Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_at:     Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by:    Mapped[int]           = mapped_column(ForeignKey("users.id"), nullable=False)
+
+    department:  Mapped["Department|None"] = relationship("Department")
+    grade:       Mapped["JobGrade|None"]   = relationship("JobGrade")
+    creator:     Mapped["User"]            = relationship("User")
+    applicants:  Mapped[list["Applicant"]] = relationship("Applicant", back_populates="posting")
+
+    def __repr__(self) -> str:
+        return f"<JobPosting '{self.title}' {self.status}>"
+
+
+class Applicant(Base, TimestampMixin):
+    """Candidate in the recruitment pipeline."""
+    __tablename__ = "hris_applicants"
+
+    id:         Mapped[int]             = mapped_column(Integer, primary_key=True)
+    posting_id: Mapped[int]             = mapped_column(ForeignKey("hris_job_postings.id"), nullable=False, index=True)
+    full_name:  Mapped[str]             = mapped_column(String(200), nullable=False)
+    email:      Mapped[str|None]        = mapped_column(String(200), nullable=True)
+    phone:      Mapped[str|None]        = mapped_column(String(30),  nullable=True)
+    source:     Mapped[ApplicantSource] = mapped_column(
+        SAEnum(ApplicantSource, values_callable=lambda x: [e.value for e in x]),
+        nullable=False, default=ApplicantSource.OTHER,
+    )
+    stage:      Mapped[ApplicantStage]  = mapped_column(
+        SAEnum(ApplicantStage, values_callable=lambda x: [e.value for e in x]),
+        nullable=False, default=ApplicantStage.RECEIVED,
+    )
+    cv_url:     Mapped[str|None]        = mapped_column(String(500), nullable=True)
+    note:       Mapped[str|None]        = mapped_column(Text, nullable=True)
+
+    posting:    Mapped["JobPosting"]        = relationship("JobPosting", back_populates="applicants")
+    interviews: Mapped[list["Interview"]]   = relationship("Interview", back_populates="applicant")
+    onboarding: Mapped[list["OnboardingTask"]] = relationship("OnboardingTask", back_populates="applicant")
+
+    def __repr__(self) -> str:
+        return f"<Applicant '{self.full_name}' {self.stage}>"
+
+
+class Interview(Base, TimestampMixin):
+    """Scheduled interview session."""
+    __tablename__ = "hris_interviews"
+
+    id:             Mapped[int]             = mapped_column(Integer, primary_key=True)
+    applicant_id:   Mapped[int]             = mapped_column(ForeignKey("hris_applicants.id"), nullable=False, index=True)
+    scheduled_at:   Mapped[datetime]        = mapped_column(DateTime(timezone=True), nullable=False)
+    interviewer_id: Mapped[int|None]        = mapped_column(ForeignKey("users.id"), nullable=True)
+    result:         Mapped[InterviewResult] = mapped_column(
+        SAEnum(InterviewResult, values_callable=lambda x: [e.value for e in x]),
+        nullable=False, default=InterviewResult.PENDING,
+    )
+    notes:          Mapped[str|None]        = mapped_column(Text, nullable=True)
+
+    applicant:   Mapped["Applicant"]  = relationship("Applicant", back_populates="interviews")
+    interviewer: Mapped["User|None"]  = relationship("User")
+
+    def __repr__(self) -> str:
+        return f"<Interview app={self.applicant_id} {self.result}>"
+
+
+class OnboardingTask(Base, TimestampMixin):
+    """Checklist item for a hired applicant's onboarding."""
+    __tablename__ = "hris_onboarding_tasks"
+
+    id:           Mapped[int]       = mapped_column(Integer, primary_key=True)
+    applicant_id: Mapped[int]       = mapped_column(ForeignKey("hris_applicants.id"), nullable=False, index=True)
+    task:         Mapped[str]       = mapped_column(String(300), nullable=False)
+    is_completed: Mapped[bool]      = mapped_column(Boolean, nullable=False, default=False)
+    completed_at: Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
+    assigned_to:  Mapped[int|None]  = mapped_column(ForeignKey("users.id"), nullable=True)
+    sort_order:   Mapped[int]       = mapped_column(Integer, nullable=False, default=0)
+
+    applicant:   Mapped["Applicant"]  = relationship("Applicant", back_populates="onboarding")
+    assignee:    Mapped["User|None"]  = relationship("User")
+
+    def __repr__(self) -> str:
+        return f"<OnboardingTask '{self.task[:40]}' done={self.is_completed}>"

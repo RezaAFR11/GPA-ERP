@@ -17,7 +17,7 @@ from app.database import engine
 from app.menu_permissions import ensure_default_menus, require_menu_access
 from app.models import Base
 from app.routers import admin, auth, expenses, inventory, legal, notifications, petty_cash, projects, receivables, search, users, vault
-from app.routers import hris_employees, hris_attendance
+from app.routers import hris_employees, hris_attendance, hris_payroll, hris_recruitment
 
 settings = get_settings()
 
@@ -169,6 +169,10 @@ app.include_router(hris_employees.router, prefix=API_PREFIX,
                    dependencies=[Depends(require_menu_access("hris_employees", "hris_dashboard"))])
 app.include_router(hris_attendance.router, prefix=API_PREFIX,
                    dependencies=[Depends(require_menu_access("hris_attendance", "hris_leave", "hris_dashboard"))])
+app.include_router(hris_payroll.router, prefix=API_PREFIX,
+                   dependencies=[Depends(require_menu_access("hris_payroll", "hris_dashboard"))])
+app.include_router(hris_recruitment.router, prefix=API_PREFIX,
+                   dependencies=[Depends(require_menu_access("hris_recruitment", "hris_dashboard"))])
 
 # ─── Static file serving (uploaded receipts) ─────────────────────────────────
 

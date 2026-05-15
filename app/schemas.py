@@ -17,6 +17,8 @@ from app.models import (
     ExpenseStatus, ItemCategory, PettyCashReportStatus, ProjectStatus, RoleName, TxnType,
     EmpDocType, EmployeeStatus, EmploymentType,
     AttendanceSource, LeaveRequestStatus,
+    SalaryComponentType, PayrollStatus, PPh21Method,
+    PostingStatus, ApplicantStage, ApplicantSource, InterviewResult,
 )
 
 
@@ -882,3 +884,183 @@ class LeaveRequestResponse(ORMBase):
     employee:              EmployeeResponse | None = None
     created_at:            datetime
     updated_at:            datetime
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HRIS H3 — Payroll schemas
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SalaryComponentCreate(BaseModel):
+    code:           str
+    name:           str
+    component_type: SalaryComponentType
+    is_taxable:     bool = True
+    is_active:      bool = True
+
+
+class SalaryComponentResponse(ORMBase):
+    id:             int
+    code:           str
+    name:           str
+    component_type: SalaryComponentType
+    is_taxable:     bool
+    is_active:      bool
+
+
+class SalaryAssignmentCreate(BaseModel):
+    employee_id:    int
+    component_id:   int
+    amount:         Decimal
+    effective_from: date
+    effective_to:   date | None = None
+
+
+class SalaryAssignmentResponse(ORMBase):
+    id:             int
+    employee_id:    int
+    component_id:   int
+    component:      SalaryComponentResponse
+    amount:         Decimal
+    effective_from: date
+    effective_to:   date | None
+
+
+class PayrollPeriodCreate(BaseModel):
+    year:  int
+    month: int
+
+
+class PayrollPeriodResponse(ORMBase):
+    id:        int
+    year:      int
+    month:     int
+    status:    PayrollStatus
+    locked_at: datetime | None
+    locked_by: int | None
+    created_at: datetime
+
+
+class BPJSBreakdown(BaseModel):
+    """BPJS contribution summary (employee + employer)."""
+    jht_employee:  Decimal
+    jht_employer:  Decimal
+    jp_employee:   Decimal
+    jp_employer:   Decimal
+    jkk_employer:  Decimal
+    jkm_employer:  Decimal
+    kes_employee:  Decimal
+    kes_employer:  Decimal
+    total_employee: Decimal
+    total_employer: Decimal
+
+
+class PayrollRunResponse(ORMBase):
+    id:                int
+    period_id:         int
+    employee_id:       int
+    employee:          EmployeeResponse | None = None
+    gross_salary:      Decimal
+    bpjs_tk_employee:  Decimal
+    bpjs_tk_employer:  Decimal
+    bpjs_kes_employee: Decimal
+    bpjs_kes_employer: Decimal
+    pph21_amount:      Decimal
+    pph21_method:      PPh21Method
+    net_salary:        Decimal
+    thr_amount:        Decimal | None
+    components_snapshot: dict | None
+    cost_centre_id:    int | None
+    expense_id:        int | None
+    created_at:        datetime
+    updated_at:        datetime
+
+
+class PayrollRunAdjust(BaseModel):
+    gross_salary:   Decimal | None = None
+    thr_amount:     Decimal | None = None
+    pph21_method:   PPh21Method | None = None
+    cost_centre_id: int | None = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HRIS H4 — Rekrutmen schemas
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class JobPostingCreate(BaseModel):
+    title:         str
+    department_id: int | None = None
+    grade_id:      int | None = None
+    description:   str | None = None
+    requirements:  str | None = None
+
+
+class JobPostingResponse(ORMBase):
+    id:            int
+    title:         str
+    department_id: int | None
+    grade_id:      int | None
+    description:   str | None
+    requirements:  str | None
+    status:        PostingStatus
+    opened_at:     datetime | None
+    closed_at:     datetime | None
+    created_by:    int
+    created_at:    datetime
+
+
+class ApplicantCreate(BaseModel):
+    posting_id: int
+    full_name:  str
+    email:      str | None = None
+    phone:      str | None = None
+    source:     ApplicantSource = ApplicantSource.OTHER
+    note:       str | None = None
+
+
+class ApplicantResponse(ORMBase):
+    id:         int
+    posting_id: int
+    full_name:  str
+    email:      str | None
+    phone:      str | None
+    source:     ApplicantSource
+    stage:      ApplicantStage
+    cv_url:     str | None
+    note:       str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class InterviewCreate(BaseModel):
+    applicant_id:   int
+    scheduled_at:   datetime
+    interviewer_id: int | None = None
+    notes:          str | None = None
+
+
+class InterviewResponse(ORMBase):
+    id:             int
+    applicant_id:   int
+    scheduled_at:   datetime
+    interviewer_id: int | None
+    result:         InterviewResult
+    notes:          str | None
+    created_at:     datetime
+
+
+class OnboardingTaskResponse(ORMBase):
+    id:           int
+    applicant_id: int
+    task:         str
+    is_completed: bool
+    completed_at: datetime | None
+    assigned_to:  int | None
+    sort_order:   int
+
+
+class HireRequest(BaseModel):
+    """Body for POST /hris/applicants/{id}/hire."""
+    department_id:  int | None = None
+    grade_id:       int | None = None
+    join_date:      date | None = None
+    create_user:    bool = False
