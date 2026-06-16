@@ -15,14 +15,6 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # ── Enums ──────────────────────────────────────────────────────────────────
-    for name, values in [
-        ("salarycomponenttype", ["BASIC", "ALLOWANCE", "DEDUCTION", "BPJS", "TAX"]),
-        ("payrollstatus",       ["OPEN", "LOCKED", "POSTED"]),
-        ("pph21method",         ["GROSS_UP", "NETTO"]),
-    ]:
-        postgresql.ENUM(*values, name=name).create(op.get_bind(), checkfirst=True)
-
     # ── hris_salary_components ─────────────────────────────────────────────────
     op.create_table(
         "hris_salary_components",

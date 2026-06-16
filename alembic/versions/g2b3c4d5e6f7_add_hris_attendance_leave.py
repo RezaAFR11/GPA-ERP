@@ -16,18 +16,6 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # ── Enums ──────────────────────────────────────────────────────────────────
-    attendance_source = postgresql.ENUM(
-        "manual", "mobile", "fingerprint", "import",
-        name="attendancesource", create_type=True
-    )
-    leave_request_status = postgresql.ENUM(
-        "draft", "submitted", "approved", "rejected",
-        name="leaverequeststatus", create_type=True
-    )
-    attendance_source.create(op.get_bind(), checkfirst=True)
-    leave_request_status.create(op.get_bind(), checkfirst=True)
-
     # ── face_embedding on employees ────────────────────────────────────────────
     op.add_column(
         "hris_employees",

@@ -16,9 +16,6 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    status_enum = sa.Enum("DRAFT", "POSTED", "VOID", name="pettycashreportstatus")
-    status_enum.create(op.get_bind(), checkfirst=True)
-
     op.create_table(
         "petty_cash_reports",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -29,7 +26,7 @@ def upgrade() -> None:
         sa.Column("cost_centre_id", sa.Integer(), nullable=True),
         sa.Column("title", sa.String(255), nullable=True),
         sa.Column("notes", sa.Text(), nullable=True),
-        sa.Column("status", status_enum, nullable=False),
+        sa.Column("status", sa.Enum("DRAFT", "POSTED", "VOID", name="pettycashreportstatus"), nullable=False),
         sa.Column("total_amount", sa.Numeric(18, 2), nullable=False, server_default="0"),
         sa.Column("created_by", sa.Integer(), nullable=False),
         sa.Column("posted_at", sa.DateTime(timezone=True), nullable=True),
