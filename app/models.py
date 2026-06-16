@@ -212,7 +212,7 @@ class Project(Base, TimestampMixin):
     start_date:     Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
     end_date:       Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
     status:         Mapped[ProjectStatus] = mapped_column(
-        SAEnum(ProjectStatus), nullable=False, default=ProjectStatus.ACTIVE
+        SAEnum(ProjectStatus, values_callable=lambda x: [e.value for e in x]), nullable=False, default=ProjectStatus.ACTIVE
     )
     imported_at:    Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -397,7 +397,7 @@ class AccountReceivable(Base, TimestampMixin):
     remaining_amount: Mapped[Decimal|None] = mapped_column(Numeric(18, 2), nullable=True)
     paid_at:      Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
     status:       Mapped[ARStatus]   = mapped_column(
-        SAEnum(ARStatus), nullable=False, default=ARStatus.DRAFT
+        SAEnum(ARStatus, values_callable=lambda x: [e.value for e in x]), nullable=False, default=ARStatus.DRAFT
     )
     confirmed_by: Mapped[int|None]   = mapped_column(ForeignKey("users.id"), nullable=True)
     confirmed_at: Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -442,7 +442,7 @@ class Expense(Base, TimestampMixin):
     reference_no:       Mapped[str|None]      = mapped_column(String(100), nullable=True)
     receipt_url:        Mapped[str|None]      = mapped_column(String(2048), nullable=True)
     status:             Mapped[ExpenseStatus] = mapped_column(
-        SAEnum(ExpenseStatus), nullable=False, default=ExpenseStatus.DRAFT
+        SAEnum(ExpenseStatus, values_callable=lambda x: [e.value for e in x]), nullable=False, default=ExpenseStatus.DRAFT
     )
 
     # Actor FKs
@@ -495,7 +495,7 @@ class PettyCashReport(Base, TimestampMixin):
     title:          Mapped[str|None]              = mapped_column(String(255), nullable=True)
     notes:          Mapped[str|None]              = mapped_column(Text, nullable=True)
     status:         Mapped[PettyCashReportStatus] = mapped_column(
-        SAEnum(PettyCashReportStatus), nullable=False, default=PettyCashReportStatus.DRAFT
+        SAEnum(PettyCashReportStatus, values_callable=lambda x: [e.value for e in x]), nullable=False, default=PettyCashReportStatus.DRAFT
     )
     total_amount:   Mapped[Decimal]               = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
     created_by:     Mapped[int]                   = mapped_column(ForeignKey("users.id"), nullable=False)
@@ -557,8 +557,8 @@ class LegalDocument(Base, TimestampMixin):
     id:                 Mapped[int]           = mapped_column(Integer, primary_key=True)
     doc_number:         Mapped[str|None]      = mapped_column(String(100), unique=True, nullable=True, index=True)
     reference_number:   Mapped[str|None]      = mapped_column(String(100), nullable=True, index=True)
-    doc_type:           Mapped[DocType]       = mapped_column(SAEnum(DocType), nullable=False)
-    status:             Mapped[DocStatus]     = mapped_column(SAEnum(DocStatus), nullable=False, default=DocStatus.DRAFT)
+    doc_type:           Mapped[DocType]       = mapped_column(SAEnum(DocType, values_callable=lambda x: [e.value for e in x]), nullable=False)
+    status:             Mapped[DocStatus]     = mapped_column(SAEnum(DocStatus, values_callable=lambda x: [e.value for e in x]), nullable=False, default=DocStatus.DRAFT)
 
     # Content fields
     title:              Mapped[str]           = mapped_column(String(500), nullable=False)
