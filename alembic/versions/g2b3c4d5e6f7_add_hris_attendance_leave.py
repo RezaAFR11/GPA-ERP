@@ -16,12 +16,6 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # ── face_embedding on employees ────────────────────────────────────────────
-    op.add_column(
-        "hris_employees",
-        sa.Column("face_embedding", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-    )
-
     # ── hris_attendance_records ────────────────────────────────────────────────
     op.create_table(
         "hris_attendance_records",
@@ -132,7 +126,6 @@ def downgrade() -> None:
     op.drop_table("hris_leave_balances")
     op.drop_table("hris_leave_types")
     op.drop_table("hris_attendance_records")
-    op.drop_column("hris_employees", "face_embedding")
 
     op.execute("DROP TYPE IF EXISTS leaverequeststatus")
     op.execute("DROP TYPE IF EXISTS attendancesource")
