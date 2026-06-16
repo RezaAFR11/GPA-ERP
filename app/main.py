@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, text
 
@@ -16,8 +16,8 @@ from app.config import get_settings
 from app.database import engine
 from app.menu_permissions import ensure_default_menus, require_menu_access
 from app.models import Base
-from app.routers import admin, auth, expenses, inventory, legal, notifications, petty_cash, projects, receivables, search, users, vault
-from app.routers import hris_employees, hris_attendance, hris_payroll, hris_recruitment
+from app.routers import admin, auth, expenses, inventory, legal, notifications, petty_cash, projects, receivables, reports as reports_router, search, users, vault
+from app.routers import hris_employees, hris_attendance, hris_payroll, hris_recruitment, hris_self_service
 
 settings = get_settings()
 
@@ -58,10 +58,69 @@ def _ensure_incremental_schema():
                 conn.execute(text("ALTER TABLE expenses ADD COLUMN vendor_name VARCHAR(255)"))
             if "reference_no" not in cols:
                 conn.execute(text("ALTER TABLE expenses ADD COLUMN reference_no VARCHAR(100)"))
+            # V5.1 — reimbursement support
+            if "expense_type" not in cols:
+                # Create enum type if it doesn't exist, then add column
+                conn.execute(text("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'expensetype') THEN CREATE TYPE expensetype AS ENUM ('regular', 'reimbursement'); END IF; END $$"))
+                conn.execute(text("ALTER TABLE expenses ADD COLUMN expense_type expensetype NOT NULL DEFAULT 'regular'"))
+            if "receipt_reviewed_by" not in cols:
+                conn.execute(text("ALTER TABLE expenses ADD COLUMN receipt_reviewed_by INTEGER REFERENCES users(id)"))
+            # Make project_id nullable (reimbursements don't require a project)
+            # Safe: only alters constraint, doesn't touch data
+            try:
+                conn.execute(text("ALTER TABLE expenses ALTER COLUMN project_id DROP NOT NULL"))
+            except Exception:
+                pass  # already nullable
         if "legal_documents" in table_names:
             cols = {c["name"] for c in inspector.get_columns("legal_documents")}
             if "reference_number" not in cols:
                 conn.execute(text("ALTER TABLE legal_documents ADD COLUMN reference_number VARCHAR(100)"))
+        # HRIS work locations & geolocation columns (added in V5.1)
+        if "hris_employees" in table_names:
+            cols = {c["name"] for c in inspector.get_columns("hris_employees")}
+            if "work_location_id" not in cols:
+                # hris_work_locations must exist first — created by create_all above
+                conn.execute(text(
+                    "ALTER TABLE hris_employees ADD COLUMN work_location_id INTEGER "
+                    "REFERENCES hris_work_locations(id)"
+                ))
+            if "work_group_id" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE hris_employees ADD COLUMN work_group_id INTEGER "
+                    "REFERENCES hris_work_groups(id)"
+                ))
+            if "ptkp_status" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE hris_employees ADD COLUMN ptkp_status VARCHAR(10) DEFAULT 'TK/0'"
+                ))
+        if "hris_leave_types" in table_names:
+            cols = {c["name"] for c in inspector.get_columns("hris_leave_types")}
+            if "category" not in cols:
+                conn.execute(text("ALTER TABLE hris_leave_types ADD COLUMN IF NOT EXISTS category VARCHAR(20) DEFAULT 'annual'"))
+            if "requires_doctor_cert" not in cols:
+                conn.execute(text("ALTER TABLE hris_leave_types ADD COLUMN IF NOT EXISTS requires_doctor_cert BOOLEAN DEFAULT FALSE"))
+        if "hris_attendance_records" in table_names:
+            cols = {c["name"] for c in inspector.get_columns("hris_attendance_records")}
+            if "location_ok" not in cols:
+                conn.execute(text("ALTER TABLE hris_attendance_records ADD COLUMN location_ok BOOLEAN"))
+            if "location_distance_m" not in cols:
+                conn.execute(text("ALTER TABLE hris_attendance_records ADD COLUMN location_distance_m NUMERIC(10,1)"))
+            if "matched_work_location_id" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE hris_attendance_records ADD COLUMN matched_work_location_id INTEGER "
+                    "REFERENCES hris_work_locations(id)"
+                ))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS hris_work_groups (
+                id          SERIAL PRIMARY KEY,
+                name        VARCHAR(255) NOT NULL UNIQUE,
+                role        VARCHAR(50)  NOT NULL,
+                description TEXT,
+                is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                updated_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+            )
+        """))
         if "notifications" not in table_names:
             conn.execute(text("""
                 CREATE TABLE notifications (
@@ -77,6 +136,60 @@ def _ensure_incremental_schema():
             conn.execute(text("CREATE INDEX ix_notifications_user_id ON notifications (user_id)"))
             conn.execute(text("CREATE INDEX ix_notifications_user_is_read ON notifications (user_id, is_read)"))
             conn.execute(text("CREATE INDEX ix_notifications_created_at ON notifications (created_at DESC)"))
+
+        # ── Enhancement Pack tables ───────────────────────────────────────────
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS hris_holiday_calendar (
+                id          SERIAL PRIMARY KEY,
+                date        DATE NOT NULL UNIQUE,
+                name        VARCHAR(255) NOT NULL,
+                is_national BOOLEAN NOT NULL DEFAULT TRUE,
+                year        INTEGER NOT NULL,
+                created_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                updated_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_holiday_date ON hris_holiday_calendar (date)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_holiday_year ON hris_holiday_calendar (year)"))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS hris_overtime_requests (
+                id               SERIAL PRIMARY KEY,
+                employee_id      INTEGER NOT NULL REFERENCES hris_employees(id),
+                date             DATE NOT NULL,
+                planned_hours    NUMERIC(4,1) NOT NULL,
+                reason           TEXT NOT NULL,
+                status           VARCHAR(20) NOT NULL DEFAULT 'submitted',
+                approved_by      INTEGER REFERENCES users(id),
+                approved_at      TIMESTAMP WITH TIME ZONE,
+                rejection_reason TEXT,
+                attendance_id    INTEGER REFERENCES hris_attendance_records(id),
+                created_at       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                updated_at       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ot_requests_employee ON hris_overtime_requests (employee_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ot_requests_status ON hris_overtime_requests (status)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ot_requests_date ON hris_overtime_requests (date)"))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS hris_data_change_requests (
+                id           SERIAL PRIMARY KEY,
+                employee_id  INTEGER NOT NULL REFERENCES hris_employees(id),
+                field_name   VARCHAR(100) NOT NULL,
+                old_value    TEXT,
+                new_value    TEXT NOT NULL,
+                reason       TEXT,
+                status       VARCHAR(20) NOT NULL DEFAULT 'pending',
+                reviewed_by  INTEGER REFERENCES users(id),
+                reviewed_at  TIMESTAMP WITH TIME ZONE,
+                review_note  TEXT,
+                created_at   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                updated_at   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_data_change_employee ON hris_data_change_requests (employee_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_data_change_status ON hris_data_change_requests (status)"))
 
 
 @asynccontextmanager
@@ -111,8 +224,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=settings.allowed_origins_list,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -162,6 +275,7 @@ app.include_router(legal.router,       prefix=API_PREFIX, dependencies=[Depends(
 app.include_router(inventory.router,   prefix=API_PREFIX, dependencies=[Depends(require_menu_access("inventory"))])
 app.include_router(search.router,         prefix=API_PREFIX)
 app.include_router(notifications.router,  prefix=API_PREFIX)
+app.include_router(reports_router.router, prefix=API_PREFIX)
 app.include_router(admin.router)
 
 # ─── HRIS Routers ────────────────────────────────────────────────────────────
@@ -173,12 +287,33 @@ app.include_router(hris_payroll.router, prefix=API_PREFIX,
                    dependencies=[Depends(require_menu_access("hris_payroll", "hris_dashboard"))])
 app.include_router(hris_recruitment.router, prefix=API_PREFIX,
                    dependencies=[Depends(require_menu_access("hris_recruitment", "hris_dashboard"))])
+# Self-service: any user with attendance OR leave OR payslip access can hit /hris/me/*
+app.include_router(hris_self_service.router, prefix=API_PREFIX,
+                   dependencies=[Depends(require_menu_access("hris_attendance", "hris_leave", "hris_my_payslip"))])
 
-# ─── Static file serving (uploaded receipts) ─────────────────────────────────
+# ─── Authenticated file serving ──────────────────────────────────────────────
+# Uploaded files (receipts, selfies, employee docs) are served via an
+# authenticated endpoint so unauthenticated users cannot download them by URL.
 
 _UPLOADS_DIR = Path("uploads")
 _UPLOADS_DIR.mkdir(exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(_UPLOADS_DIR)), name="uploads")
+
+from app.dependencies import get_current_user  # noqa: E402  (after app init)
+from app.models import User  # noqa: E402
+
+@app.get("/uploads/{file_path:path}", include_in_schema=False)
+def serve_upload(
+    file_path: str,
+    _: User = Depends(get_current_user),
+):
+    """Serve uploaded files only to authenticated users."""
+    abs_path = (_UPLOADS_DIR / file_path).resolve()
+    # Prevent path traversal outside the uploads directory
+    if not str(abs_path).startswith(str(_UPLOADS_DIR.resolve())):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not abs_path.exists() or not abs_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(abs_path)
 
 # ─── Root redirect ───────────────────────────────────────────────────────────
 
