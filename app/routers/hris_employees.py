@@ -29,7 +29,7 @@ from app.schemas import (
     EmployeeCreate, EmployeeDocumentResponse, EmployeeResponse, EmployeeUpdate,
     EmployeeSummary,
     JobGradeCreate, JobGradeResponse, JobGradeUpdate,
-    MessageResponse, PaginatedResponse,
+    MessageResponse, PaginatedResponse, UserSummary,
     WorkGroupCreate, WorkGroupResponse, WorkGroupUpdate,
     HolidayCalendarCreate, HolidayCalendarResponse,
     DataChangeRequestCreate, DataChangeRequestResponse, DataChangeActionRequest,
@@ -72,6 +72,11 @@ router = APIRouter(prefix="/hris", tags=["HRIS – Employees"])
 
 # Roles allowed to manage HRIS data (GA = General Affairs / HR operator)
 _hr_roles = (RoleName.SUPER_ADMIN, RoleName.MD, RoleName.GA, RoleName.HR)
+# Roles allowed to tie employees <-> user accounts (GA/HR, PM, Project Control, MD).
+_account_link_roles = (
+    RoleName.SUPER_ADMIN, RoleName.MD, RoleName.GA, RoleName.HR,
+    RoleName.PM, RoleName.PROJECT_CONTROL,
+)
 # Only these roles may assign any role when bulk-creating accounts; GA is limited
 # to non-privileged roles (see _ga_assignable) to prevent privilege escalation.
 _account_admin_roles = (RoleName.SUPER_ADMIN, RoleName.MD)
@@ -351,12 +356,58 @@ def create_employee(
     return emp
 
 
+@router.get("/employees/linkable-users", response_model=list[UserSummary],
+            summary="Active user accounts not yet linked to any employee")
+def linkable_users(
+    current_user: Annotated[CurrentUser, Depends(require_role(*_account_link_roles))],
+    db:           Annotated[Session, Depends(get_db)],
+):
+    linked = {
+        uid for (uid,) in
+        db.query(Employee.user_id).filter(Employee.user_id.isnot(None)).all()
+    }
+    q = db.query(User).filter(User.is_active == True)
+    if linked:
+        q = q.filter(~User.id.in_(linked))
+    return q.order_by(User.full_name).all()
+
+
+@router.post("/employees/{emp_id}/link-user/{user_id}", response_model=EmployeeResponse,
+             summary="Link an existing employee to an existing user account")
+def link_employee_user(
+    emp_id:       int,
+    user_id:      int,
+    request:      Request,
+    current_user: Annotated[CurrentUser, Depends(require_role(*_account_link_roles))],
+    db:           Annotated[Session, Depends(get_db)],
+):
+    emp = db.query(Employee).filter(Employee.id == emp_id).first()
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+    if emp.user_id:
+        raise HTTPException(409, "Employee is already linked to a user account")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+    if db.query(Employee).filter(Employee.user_id == user_id).first():
+        raise HTTPException(409, "User is already linked to another employee")
+
+    before = model_to_dict(emp)
+    emp.user_id = user.id
+    write_audit(db, "Employee", emp.id, "LINK_USER",
+                changed_by=current_user.id, ip_address=get_client_ip(request),
+                before=before, after=model_to_dict(emp))
+    db.commit()
+    db.refresh(emp)
+    return emp
+
+
 @router.post("/employees/from-user/{user_id}", response_model=EmployeeResponse,
              summary="Create or link an employee (pegawai) record for an existing user account")
 def employee_from_user(
     user_id:      int,
     request:      Request,
-    current_user: Annotated[CurrentUser, Depends(require_role(*_hr_roles))],
+    current_user: Annotated[CurrentUser, Depends(require_role(*_account_link_roles))],
     db:           Annotated[Session, Depends(get_db)],
 ):
     """Idempotent: returns the existing linked employee, links an unlinked
