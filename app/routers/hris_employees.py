@@ -62,8 +62,12 @@ def _seed_user_menus(db: Session, user: User) -> None:
 
 router = APIRouter(prefix="/hris", tags=["HRIS – Employees"])
 
-# Roles allowed to manage HRIS data
-_hr_roles = (RoleName.SUPER_ADMIN, RoleName.MD)
+# Roles allowed to manage HRIS data (GA = General Affairs / HR operator)
+_hr_roles = (RoleName.SUPER_ADMIN, RoleName.MD, RoleName.GA)
+# Only these roles may assign any role when bulk-creating accounts; GA is limited
+# to non-privileged roles (see _ga_assignable) to prevent privilege escalation.
+_account_admin_roles = (RoleName.SUPER_ADMIN, RoleName.MD)
+_ga_assignable       = (RoleName.WORKER, RoleName.STAFF)
 
 _UPLOADS_DIR = Path("uploads") / "employee_docs"
 _UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -539,6 +543,17 @@ def bulk_create_accounts(
             results.append(BulkAccountResult(
                 employee_id=emp.id, employee_no=emp.employee_no, full_name=emp.full_name,
                 status="error", detail=f"Role '{item.role_name}' not found in DB",
+            ))
+            continue
+
+        # Privilege guard: only SUPER_ADMIN / MD may grant elevated roles.
+        # GA (and any other HR operator) may only create WORKER / STAFF accounts.
+        if (current_user.role.name not in _account_admin_roles
+                and role.name not in _ga_assignable):
+            results.append(BulkAccountResult(
+                employee_id=emp.id, employee_no=emp.employee_no, full_name=emp.full_name,
+                status="error",
+                detail=f"Not permitted to assign role {role.name.value}",
             ))
             continue
 

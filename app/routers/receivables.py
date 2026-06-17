@@ -19,7 +19,7 @@ from app.schemas import ARConfirm, ARCreate, ARResponse, ARUpdate, MessageRespon
 
 router = APIRouter(prefix="/receivables", tags=["Revenue – Account Receivables"])
 
-_create_roles  = (RoleName.SUPER_ADMIN, RoleName.MD, RoleName.PM, RoleName.FINANCE)
+_create_roles  = (RoleName.SUPER_ADMIN, RoleName.MD, RoleName.FINANCE)
 _confirm_roles = (RoleName.SUPER_ADMIN, RoleName.MD)
 
 
