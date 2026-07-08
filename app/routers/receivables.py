@@ -8,14 +8,14 @@ from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, require_role
 from app.models import ARStatus, AccountReceivable, Project, RoleName
-from app.schemas import ARConfirm, ARCreate, ARResponse, ARUpdate, MessageResponse, PaginatedResponse
+from app.schemas import ARConfirm, ARCreate, ARResponse, ARSummary, ARUpdate, MessageResponse, PaginatedResponse
 
 router = APIRouter(prefix="/receivables", tags=["Revenue – Account Receivables"])
 
@@ -30,6 +30,49 @@ def _get_or_404(ar_id: int, db: Session) -> AccountReceivable:
     return ar
 
 
+def _paid_amount_expr():
+    return case(
+        (AccountReceivable.actual_payment.isnot(None), AccountReceivable.actual_payment),
+        (AccountReceivable.status == ARStatus.CONFIRMED, AccountReceivable.amount),
+        else_=Decimal("0"),
+    )
+
+
+def _remaining_amount_expr(paid_expr):
+    return case(
+        (AccountReceivable.remaining_amount.isnot(None), func.greatest(AccountReceivable.remaining_amount, 0)),
+        else_=func.greatest(AccountReceivable.amount - paid_expr, 0),
+    )
+
+
+def _apply_receivable_filters(
+    q,
+    project_id: int | None = None,
+    ar_status: ARStatus | None = None,
+    search: str | None = None,
+    payment_state: str | None = None,
+):
+    if project_id:
+        q = q.filter(AccountReceivable.project_id == project_id)
+    if ar_status:
+        q = q.filter(AccountReceivable.status == ar_status)
+    if search:
+        q = q.filter(or_(
+            AccountReceivable.invoice_no.ilike(f"%{search}%"),
+            AccountReceivable.customer_name.ilike(f"%{search}%"),
+        ))
+
+    paid_expr = _paid_amount_expr()
+    remaining_expr = _remaining_amount_expr(paid_expr)
+    if payment_state == "paid":
+        q = q.filter(paid_expr > 0, remaining_expr <= Decimal("1"))
+    elif payment_state == "partial":
+        q = q.filter(paid_expr > 0, remaining_expr > Decimal("1"))
+    elif payment_state == "open":
+        q = q.filter(paid_expr <= 0)
+    return q
+
+
 @router.get("", response_model=PaginatedResponse[ARResponse], summary="List receivables")
 def list_receivables(
     current_user:  CurrentUser,
@@ -41,34 +84,53 @@ def list_receivables(
     skip:          int = Query(0, ge=0),
     limit:         int = Query(100, ge=1, le=500),
 ):
-    q = db.query(AccountReceivable)
-    if project_id:
-        q = q.filter(AccountReceivable.project_id == project_id)
-    if ar_status:
-        q = q.filter(AccountReceivable.status == ar_status)
-    if search:
-        q = q.filter(or_(
-            AccountReceivable.invoice_no.ilike(f"%{search}%"),
-            AccountReceivable.customer_name.ilike(f"%{search}%"),
-        ))
-    if payment_state == "paid":
-        q = q.filter(
-            (AccountReceivable.remaining_amount <= 0) |
-            (AccountReceivable.actual_payment >= AccountReceivable.amount)
-        )
-    elif payment_state == "partial":
-        q = q.filter(
-            AccountReceivable.actual_payment > 0,
-            AccountReceivable.remaining_amount > 0,
-        )
-    elif payment_state == "open":
-        q = q.filter(
-            (AccountReceivable.actual_payment == None) |
-            (AccountReceivable.actual_payment == 0)
-        )
+    q = _apply_receivable_filters(
+        db.query(AccountReceivable),
+        project_id=project_id,
+        ar_status=ar_status,
+        search=search,
+        payment_state=payment_state,
+    )
     total = q.count()
     items = q.order_by(AccountReceivable.id.desc()).offset(skip).limit(limit).all()
     return {"items": items, "total": total}
+
+
+@router.get("/summary", response_model=ARSummary, summary="Receivables summary totals")
+def receivables_summary(
+    current_user:  CurrentUser,
+    db:            Annotated[Session, Depends(get_db)],
+    project_id:    int | None      = None,
+    ar_status:     ARStatus | None = None,
+    search:        str | None      = Query(None, description="Search invoice number or customer name"),
+    payment_state: str | None      = Query(None, description="Filter by payment state: paid | partial | open"),
+):
+    paid_expr = _paid_amount_expr()
+    remaining_expr = _remaining_amount_expr(paid_expr)
+    q = _apply_receivable_filters(
+        db.query(
+            func.coalesce(func.sum(AccountReceivable.amount), 0).label("total_invoiced"),
+            func.coalesce(func.sum(paid_expr), 0).label("total_paid"),
+            func.coalesce(func.sum(remaining_expr), 0).label("total_outstanding"),
+            func.count(AccountReceivable.id).label("count"),
+        ),
+        project_id=project_id,
+        ar_status=ar_status,
+        search=search,
+        payment_state=payment_state,
+    )
+    row = q.one()._mapping
+    total_invoiced = row["total_invoiced"] or Decimal("0")
+    total_paid = row["total_paid"] or Decimal("0")
+    total_outstanding = row["total_outstanding"] or Decimal("0")
+    collection_rate = float((total_paid / total_invoiced) * Decimal("100")) if total_invoiced else 0.0
+    return ARSummary(
+        total_invoiced=total_invoiced,
+        total_paid=total_paid,
+        total_outstanding=total_outstanding,
+        collection_rate=collection_rate,
+        count=row["count"] or 0,
+    )
 
 
 @router.post("", response_model=ARResponse, status_code=201,

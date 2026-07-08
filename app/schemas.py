@@ -328,6 +328,14 @@ class ARResponse(ORMBase):
     confirmer:    UserSummary | None = None
 
 
+class ARSummary(BaseModel):
+    total_invoiced:    Decimal
+    total_paid:        Decimal
+    total_outstanding: Decimal
+    collection_rate:   float
+    count:             int
+
+
 # ─── Expense ─────────────────────────────────────────────────────────────────
 
 class ExpenseCreate(BaseModel):
