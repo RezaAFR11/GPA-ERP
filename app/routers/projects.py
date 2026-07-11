@@ -20,7 +20,10 @@ from sqlalchemy.orm import Session
 from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, require_role
-from app.models import Project, ProjectDocument, ProjectStatus, RoleName
+from app.models import (
+    AccountReceivable, Expense, InventoryTxn, LegalDocument, PettyCashReport,
+    Project, ProjectDocument, ProjectStatus, RoleName,
+)
 from app.schemas import (
     MessageResponse, PaginatedResponse, ProjectCreate, ProjectDocumentResponse,
     ProjectImportResult, ProjectResponse, ProjectUpdate,
@@ -164,15 +167,53 @@ def delete_project(
     current_user: Annotated[object, Depends(require_role(RoleName.SUPER_ADMIN, RoleName.MD))],
     db:           Annotated[Session, Depends(get_db)],
 ):
-    """Soft-delete by setting status=CANCELLED. Hard delete not permitted."""
     project = _get_or_404(project_id, db)
+    if not project.is_archived:
+        raise HTTPException(status_code=409, detail="Archive project before deleting it permanently")
+
     before  = model_to_dict(project)
-    project.status = ProjectStatus.CANCELLED
-    write_audit(db, "Project", project.id, "CANCEL",
+
+    petty_reports = db.query(PettyCashReport).filter(PettyCashReport.project_id == project_id).all()
+    petty_line_ids = [line.id for report in petty_reports for line in report.lines]
+    related_counts = {
+        "project_documents": db.query(ProjectDocument).filter(ProjectDocument.project_id == project_id).count(),
+        "receivables": db.query(AccountReceivable).filter(AccountReceivable.project_id == project_id).count(),
+        "expenses": db.query(Expense).filter(Expense.project_id == project_id).count(),
+        "petty_cash_reports": len(petty_reports),
+        "petty_cash_lines": len(petty_line_ids),
+    }
+
+    if petty_line_ids:
+        db.query(Expense).filter(Expense.petty_cash_line_id.in_(petty_line_ids)).update(
+            {Expense.petty_cash_line_id: None},
+            synchronize_session=False,
+        )
+        db.flush()
+
+    for doc in db.query(ProjectDocument).filter(ProjectDocument.project_id == project_id).all():
+        db.delete(doc)
+    for receivable in db.query(AccountReceivable).filter(AccountReceivable.project_id == project_id).all():
+        db.delete(receivable)
+    for expense in db.query(Expense).filter(Expense.project_id == project_id).all():
+        db.delete(expense)
+    for report in petty_reports:
+        db.delete(report)
+
+    db.query(LegalDocument).filter(LegalDocument.project_id == project_id).update(
+        {LegalDocument.project_id: None},
+        synchronize_session=False,
+    )
+    db.query(InventoryTxn).filter(InventoryTxn.project_id == project_id).update(
+        {InventoryTxn.project_id: None},
+        synchronize_session=False,
+    )
+
+    write_audit(db, "Project", project.id, "DELETE",
                 changed_by=current_user.id, ip_address=get_client_ip(request),
-                before=before, after=model_to_dict(project))
+                before={**before, "deleted_related": related_counts})
+    db.delete(project)
     db.commit()
-    return MessageResponse(message=f"Project {project.code} cancelled")
+    return MessageResponse(message=f"Archived project {project.code} deleted")
 
 
 # ─── Excel / CSV Import ──────────────────────────────────────────────────────

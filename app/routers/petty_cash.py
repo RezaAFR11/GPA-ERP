@@ -14,9 +14,10 @@ from sqlalchemy.orm import Session, joinedload
 from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, require_role
+from app.menu_permissions import require_menu_access
 from app.models import (
     CostCentre, CostCode, Expense, ExpenseStatus, PettyCashReport,
-    PettyCashReportLine, PettyCashReportStatus, Project, RoleName, User,
+    PettyCashReportLine, PettyCashReportStatus, Project, ProjectStatus, RoleName, User,
 )
 
 # STAFF cannot create or post petty cash reports — GA and above only
@@ -26,7 +27,11 @@ from app.schemas import (
     PettyCashReportCreate, PettyCashReportResponse, PettyCashReportUpdate,
 )
 
-router = APIRouter(prefix="/petty-cash-reports", tags=["Spending - Petty Cash"])
+router = APIRouter(
+    prefix="/petty-cash-reports",
+    tags=["Spending - Petty Cash"],
+    dependencies=[Depends(require_menu_access("petty_cash"))],
+)
 
 
 def _get_or_404(report_id: int, db: Session) -> PettyCashReport:
@@ -42,8 +47,11 @@ def _validate_master_data(
     cost_code_id: int,
     cost_centre_id: int | None,
 ) -> None:
-    if not db.query(Project).filter(Project.id == project_id).first():
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    if project.is_archived or project.status != ProjectStatus.ACTIVE:
+        raise HTTPException(status_code=409, detail="Petty cash requires an active, non-archived project")
     if not db.query(CostCode).filter(CostCode.id == cost_code_id, CostCode.is_active == True).first():
         raise HTTPException(status_code=404, detail="Cost code not found or inactive")
     if cost_centre_id and not db.query(CostCentre).filter(
@@ -340,4 +348,3 @@ def post_report(
     db.commit()
     db.refresh(report)
     return report
-

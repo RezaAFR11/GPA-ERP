@@ -156,7 +156,12 @@ def export_payroll_summary(
 
 _PROJECT_ROLES = (RoleName.MD, RoleName.COST_CONTROL, RoleName.FINANCE, RoleName.SUPER_ADMIN)
 
-_PAID_STATUSES = [ExpenseStatus.PAID.value, ExpenseStatus.HARD_LOCKED.value]
+_COMMITTED_STATUSES = [
+    ExpenseStatus.VERIFIED.value,
+    ExpenseStatus.APPROVED.value,
+    ExpenseStatus.PAID.value,
+    ExpenseStatus.HARD_LOCKED.value,
+]
 
 
 @router.get("/project-financial", summary="Export project financial report to XLSX")
@@ -183,11 +188,11 @@ def export_project_financial(
 
     projects = q.order_by(Project.id).all()
 
-    # Pre-fetch paid expense sums per project in one query
-    paid_sums = dict(
+    # Match the committed-spend definition used by Project and the web reports.
+    committed_sums = dict(
         db.query(Expense.project_id, func.coalesce(func.sum(Expense.amount), 0))
         .filter(
-            Expense.status.in_(_PAID_STATUSES),
+            Expense.status.in_(_COMMITTED_STATUSES),
             Expense.project_id.isnot(None),
         )
         .group_by(Expense.project_id)
@@ -206,7 +211,7 @@ def export_project_financial(
 
     for row_idx, project in enumerate(projects, start=1):
         contract_value = float(project.contract_value or 0)
-        budget_used    = float(paid_sums.get(project.id, Decimal("0")))
+        budget_used    = float(committed_sums.get(project.id, Decimal("0")))
         burn_rate      = round(budget_used / contract_value * 100, 2) if contract_value else 0.0
 
         ws.cell(row=row_idx + 1, column=1, value=row_idx)

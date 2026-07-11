@@ -259,7 +259,7 @@ class Project(Base, TimestampMixin):
         """Sum of all confirmed Account Receivables — the recognised revenue ceiling."""
         return sum(
             (
-                ar.actual_payment if ar.actual_payment is not None else ar.amount
+                ar.amount
                 for ar in self.receivables
                 if ar.status == ARStatus.CONFIRMED
             ),
@@ -271,7 +271,7 @@ class Project(Base, TimestampMixin):
     def total_revenue(cls):
         from sqlalchemy import select
         return (
-            select(func.coalesce(func.sum(func.coalesce(AccountReceivable.actual_payment, AccountReceivable.amount)), 0))
+            select(func.coalesce(func.sum(AccountReceivable.amount), 0))
             .where(
                 AccountReceivable.project_id == cls.id,
                 AccountReceivable.status == ARStatus.CONFIRMED,

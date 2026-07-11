@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, require_role
-from app.models import ARStatus, AccountReceivable, Project, RoleName
+from app.models import ARStatus, AccountReceivable, Project, ProjectStatus, RoleName
 from app.schemas import ARConfirm, ARCreate, ARResponse, ARSummary, ARUpdate, MessageResponse, PaginatedResponse
 
 router = APIRouter(prefix="/receivables", tags=["Revenue – Account Receivables"])
@@ -33,16 +33,21 @@ def _get_or_404(ar_id: int, db: Session) -> AccountReceivable:
 def _paid_amount_expr():
     return case(
         (AccountReceivable.actual_payment.isnot(None), AccountReceivable.actual_payment),
-        (AccountReceivable.status == ARStatus.CONFIRMED, AccountReceivable.amount),
         else_=Decimal("0"),
     )
 
 
 def _remaining_amount_expr(paid_expr):
-    return case(
-        (AccountReceivable.remaining_amount.isnot(None), func.greatest(AccountReceivable.remaining_amount, 0)),
-        else_=func.greatest(AccountReceivable.amount - paid_expr, 0),
-    )
+    return func.greatest(AccountReceivable.amount - paid_expr, 0)
+
+
+def _require_active_project(project_id: int, db: Session) -> Project:
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.is_archived or project.status != ProjectStatus.ACTIVE:
+        raise HTTPException(status_code=409, detail="New invoices require an active, non-archived project")
+    return project
 
 
 def _apply_receivable_filters(
@@ -141,9 +146,11 @@ def create_receivable(
     current_user: Annotated[object, Depends(require_role(*_create_roles))],
     db:           Annotated[Session, Depends(get_db)],
 ):
-    project = db.query(Project).filter(Project.id == payload.project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    _require_active_project(payload.project_id, db)
+
+    paid_amount = payload.actual_payment or Decimal("0")
+    if paid_amount > payload.amount:
+        raise HTTPException(status_code=422, detail="Payment received cannot exceed invoice amount")
 
     ar = AccountReceivable(
         project_id        = payload.project_id,
@@ -155,7 +162,7 @@ def create_receivable(
         due_date          = payload.due_date,
         expected_payment  = payload.expected_payment,
         actual_payment    = payload.actual_payment,
-        remaining_amount  = payload.remaining_amount,
+        remaining_amount  = max(payload.amount - paid_amount, Decimal("0")),
         paid_at           = payload.paid_at,
         status            = ARStatus.DRAFT,
     )
@@ -191,6 +198,10 @@ def update_receivable(
     before = model_to_dict(ar)
 
     updates = payload.model_dump(exclude_unset=True)
+    updates.pop("remaining_amount", None)
+
+    if "project_id" in updates and updates["project_id"] != ar.project_id:
+        _require_active_project(updates["project_id"], db)
 
     # Once confirmed, the receivable drives the project budget ceiling —
     # amount/project can no longer be changed, only payment tracking fields.
@@ -206,8 +217,10 @@ def update_receivable(
     for field, value in updates.items():
         setattr(ar, field, value)
 
-    if ar.actual_payment is not None and ar.remaining_amount is None:
-        ar.remaining_amount = max(ar.amount - ar.actual_payment, Decimal("0"))
+    paid_amount = ar.actual_payment or Decimal("0")
+    if paid_amount > ar.amount:
+        raise HTTPException(status_code=422, detail="Payment received cannot exceed invoice amount")
+    ar.remaining_amount = max(ar.amount - paid_amount, Decimal("0"))
 
     write_audit(db, "AccountReceivable", ar.id, "UPDATE",
                 changed_by=current_user.id, ip_address=get_client_ip(request),

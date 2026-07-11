@@ -44,7 +44,7 @@ from app.dependencies import (
     CurrentUser, get_client_ip, get_required_approvers_from_matrix, require_role,
 )
 from app.models import (
-    CostCentre, CostCode, Expense, ExpenseStatus, ExpenseType, Project, RoleName,
+    CostCentre, CostCode, Expense, ExpenseStatus, ExpenseType, Project, ProjectStatus, RoleName,
     effective_roles,
 )
 from app.notify import push, push_to_role
@@ -319,8 +319,11 @@ def create_expense(
 
     # Project is required for regular expenses, optional for reimbursements
     if payload.project_id is not None:
-        if not db.query(Project).filter(Project.id == payload.project_id).first():
+        project = db.query(Project).filter(Project.id == payload.project_id).first()
+        if not project:
             raise HTTPException(status_code=404, detail="Project not found")
+        if project.is_archived or project.status != ProjectStatus.ACTIVE:
+            raise HTTPException(status_code=409, detail="New expenses require an active, non-archived project")
     elif payload.expense_type == ExpenseType.REGULAR:
         raise HTTPException(status_code=422, detail="project_id is required for regular expenses")
 
@@ -687,7 +690,7 @@ def reject_expense(
     allowed_rejectors = set(expense.approval_chain or []) | {
         RoleName.SUPER_ADMIN.value, RoleName.FINANCE.value
     }
-    if current_user.role.name.value not in allowed_rejectors:
+    if not any(role.value in allowed_rejectors for role in effective_roles(current_user.role.name)):
         raise HTTPException(status_code=403, detail="You are not in the approval chain")
 
     before = model_to_dict(expense)
@@ -712,6 +715,36 @@ def reject_expense(
 
 
 # ─── Audit trail for one expense ─────────────────────────────────────────────
+
+@router.delete("/{expense_id}", response_model=MessageResponse,
+               summary="Delete a draft or rejected expense")
+def delete_expense(
+    expense_id:   int,
+    request:      Request,
+    current_user: CurrentUser,
+    db:           Annotated[Session, Depends(get_db)],
+):
+    expense = _get_or_404(expense_id, db)
+
+    if expense.status not in {ExpenseStatus.DRAFT, ExpenseStatus.REJECTED}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete an expense with status '{expense.status}'",
+        )
+
+    if expense.submitted_by != current_user.id and current_user.role.name not in (
+        RoleName.SUPER_ADMIN, RoleName.COST_CONTROL
+    ):
+        raise HTTPException(status_code=403, detail="Not your expense")
+
+    before = model_to_dict(expense)
+    write_audit(db, "Expense", expense.id, "DELETE",
+                changed_by=current_user.id, ip_address=get_client_ip(request),
+                before=before)
+    db.delete(expense)
+    db.commit()
+    return MessageResponse(message=f"Expense #{expense_id} deleted")
+
 
 @router.get("/{expense_id}/audit", response_model=list[dict],
             summary="Full audit trail for one expense")
