@@ -255,8 +255,8 @@ class ApprovalRuleCreate(BaseModel):
 
 
 class ApprovalRuleUpdate(BaseModel):
-    min_amount:         Decimal             | None = None
-    max_amount:         Decimal             | None = None
+    min_amount:         Decimal             | None = Field(None, ge=Decimal("0"), decimal_places=2)
+    max_amount:         Decimal             | None = Field(None, ge=Decimal("0"), decimal_places=2)
     cost_code_category: CostCodeCategory    | None = None
     required_role:      RoleName            | None = None
     priority:           int                 | None = Field(None, ge=1)
@@ -526,6 +526,7 @@ class LegalDocCreate(BaseModel):
 class LegalDocUpdate(BaseModel):
     doc_number:        str     | None = Field(None, max_length=100)
     reference_number:  str     | None = Field(None, max_length=100)
+    doc_type:          DocType | None = None
     title:             str     | None = Field(None, min_length=3, max_length=500)
     subject:           str     | None = Field(None, min_length=3, max_length=500)
     body:              str     | None = Field(None, min_length=10)
@@ -590,6 +591,12 @@ class InventoryItemUpdate(BaseModel):
     location:   str     | None = Field(None, max_length=255)
     notes:      str     | None = None
     is_active:  bool    | None = None
+
+
+class InventorySummary(BaseModel):
+    total_items:     int
+    low_stock_count: int
+    total_value:     Decimal
 
 
 class InventoryTxnCreate(BaseModel):

@@ -16,7 +16,7 @@ DEFAULT_MENUS = [
     ("revenue_ar", "Revenue / AR", "Finance", "/revenue", "Client invoices, payments, outstanding AR", 30),
     ("spending", "Spending", "Finance", "/spending", "Expense drafts, approvals, payment workflow", 40),
     ("petty_cash", "Petty Cash", "Finance", "/spending", "Monthly petty cash reports and OCR/clipboard entry", 45),
-    ("inventory", "Inventory & Assets", "Operations", "/inventory", "Materials, tools, consumables, stock movement", 50),
+    ("inventory", "Inventory & Stock", "Operations", "/inventory", "Materials, tools, consumables, and stock movement", 50),
     ("legal", "Legal & Proposals", "Procurement / Legal", "/legal", "Legal proposals, drafts, documents, signatures", 60),
     ("procurement", "Procurement", "Procurement / Legal", "/procurement", "PO and contract tracking", 70),
     ("reports", "Reports", "Reports", "/reports", "Finance, project, and operational reports", 80),

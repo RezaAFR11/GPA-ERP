@@ -15,7 +15,7 @@ from app.models import AuditLog, ApprovalRule, CostCentre, CostCode, RoleName
 from app.schemas import (
     ApprovalRuleCreate, ApprovalRuleResponse, ApprovalRuleUpdate,
     AuditLogResponse, CostCentreCreate, CostCentreResponse, CostCentreUpdate,
-    CostCodeCreate, CostCodeResponse, CostCodeUpdate, MessageResponse,
+    CostCodeCreate, CostCodeResponse, CostCodeUpdate, MessageResponse, PaginatedResponse,
 )
 
 router = APIRouter(prefix="/vault", tags=["Vault – Super Admin"])
@@ -269,8 +269,16 @@ def update_approval_rule(
     if not rule:
         raise HTTPException(status_code=404, detail="Approval rule not found")
 
+    updates = payload.model_dump(exclude_unset=True)
+    next_min = updates.get("min_amount", rule.min_amount)
+    next_max = updates.get("max_amount", rule.max_amount)
+    if next_min is None:
+        raise HTTPException(status_code=422, detail="min_amount cannot be null")
+    if next_max is not None and next_max <= next_min:
+        raise HTTPException(status_code=422, detail="max_amount must be greater than min_amount")
+
     before = model_to_dict(rule)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    for field, value in updates.items():
         setattr(rule, field, value)
 
     write_audit(db, "ApprovalRule", rule.id, "UPDATE",
@@ -304,7 +312,22 @@ def deactivate_approval_rule(
 
 # ─── Global Audit Log ────────────────────────────────────────────────────────
 
-@router.get("/audit-log", response_model=list[AuditLogResponse],
+@router.get("/audit-log/entity-types", response_model=list[str],
+            summary="List audit entity types — Super Admin only")
+def audit_entity_types(
+    current_user: SuperAdminUser,
+    db:           Annotated[Session, Depends(get_db)],
+):
+    return [
+        row[0]
+        for row in db.query(AuditLog.entity_type)
+        .distinct()
+        .order_by(AuditLog.entity_type)
+        .all()
+    ]
+
+
+@router.get("/audit-log", response_model=PaginatedResponse[AuditLogResponse],
             summary="Global audit log — Super Admin only")
 def global_audit_log(
     current_user:  SuperAdminUser,
@@ -312,8 +335,8 @@ def global_audit_log(
     entity_type:   str | None = None,
     entity_id:     int | None = None,
     changed_by:    int | None = None,
-    skip:          int = 0,
-    limit:         int = Query(100, le=500),
+    skip:          int = Query(0, ge=0),
+    limit:         int = Query(50, ge=1, le=500),
 ):
     q = db.query(AuditLog)
     if entity_type:
@@ -322,4 +345,6 @@ def global_audit_log(
         q = q.filter(AuditLog.entity_id == entity_id)
     if changed_by:
         q = q.filter(AuditLog.changed_by == changed_by)
-    return q.order_by(AuditLog.created_at.desc()).offset(skip).limit(limit).all()
+    total = q.count()
+    items = q.order_by(AuditLog.created_at.desc()).offset(skip).limit(limit).all()
+    return {"items": items, "total": total}

@@ -148,9 +148,9 @@ def get_document(
     return doc
 
 
-# ─── Update (draft only) ──────────────────────────────────────────────────────
+# ─── Update (draft or rejected) ───────────────────────────────────────────────
 
-@router.patch("/{doc_id}", response_model=LegalDocResponse, summary="Update a draft document")
+@router.patch("/{doc_id}", response_model=LegalDocResponse, summary="Update a draft or rejected document")
 def update_document(
     doc_id:       int,
     request:      Request,
@@ -161,14 +161,20 @@ def update_document(
     doc = db.query(LegalDocument).filter(LegalDocument.id == doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    if doc.status != DocStatus.DRAFT:
-        raise HTTPException(status_code=400, detail="Only draft documents can be edited")
+    if doc.status not in (DocStatus.DRAFT, DocStatus.REJECTED):
+        raise HTTPException(status_code=400, detail="Only draft or rejected documents can be edited")
     if doc.created_by != current_user.id and current_user.role.name not in (RoleName.SUPER_ADMIN, RoleName.MD):
         raise HTTPException(status_code=403, detail="Not your document")
 
     before = model_to_dict(doc)
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(doc, field, value)
+
+    if doc.doc_type != DocType.PROPOSAL:
+        doc.quoted_amount = None
+
+    if doc.status == DocStatus.REJECTED:
+        doc.status = DocStatus.DRAFT
 
     write_audit(db, "LegalDocument", doc.id, "UPDATE",
                 changed_by=current_user.id, ip_address=get_client_ip(request),
@@ -193,9 +199,12 @@ def submit_document(
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.status != DocStatus.DRAFT:
         raise HTTPException(status_code=400, detail="Document is not in draft status")
+    if doc.created_by != current_user.id and current_user.role.name != RoleName.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Not authorized to submit this document")
 
     before = model_to_dict(doc)
-    doc.status = DocStatus.SUBMITTED
+    doc.status         = DocStatus.SUBMITTED
+    doc.rejection_note = None
     write_audit(db, "LegalDocument", doc.id, "SUBMIT",
                 changed_by=current_user.id, ip_address=get_client_ip(request),
                 before=before, after=model_to_dict(doc))
@@ -236,7 +245,7 @@ def sign_document(
 # ─── Reject ───────────────────────────────────────────────────────────────────
 
 @router.post("/{doc_id}/reject", response_model=LegalDocResponse,
-             summary="Reject — returns to draft (MD/PM only)")
+             summary="Reject a submitted document (MD/PM only)")
 def reject_document(
     doc_id:       int,
     request:      Request,
@@ -251,7 +260,7 @@ def reject_document(
         raise HTTPException(status_code=400, detail="Only submitted documents can be rejected")
 
     before = model_to_dict(doc)
-    doc.status         = DocStatus.DRAFT
+    doc.status         = DocStatus.REJECTED
     doc.rejection_note = payload.note
 
     write_audit(db, "LegalDocument", doc.id, "REJECT",
@@ -262,9 +271,9 @@ def reject_document(
     return doc
 
 
-# ─── Delete (draft only, own doc or admin) ────────────────────────────────────
+# ─── Delete (draft/rejected, own doc or admin) ─────────────────────────────────
 
-@router.delete("/{doc_id}", response_model=MessageResponse, summary="Delete a draft document")
+@router.delete("/{doc_id}", response_model=MessageResponse, summary="Delete a draft or rejected document")
 def delete_document(
     doc_id:       int,
     request:      Request,
@@ -274,8 +283,8 @@ def delete_document(
     doc = db.query(LegalDocument).filter(LegalDocument.id == doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    if doc.status != DocStatus.DRAFT:
-        raise HTTPException(status_code=400, detail="Only draft documents can be deleted")
+    if doc.status not in (DocStatus.DRAFT, DocStatus.REJECTED):
+        raise HTTPException(status_code=400, detail="Only draft or rejected documents can be deleted")
     if doc.created_by != current_user.id and current_user.role.name not in (RoleName.SUPER_ADMIN, RoleName.MD):
         raise HTTPException(status_code=403, detail="Not authorized")
 
