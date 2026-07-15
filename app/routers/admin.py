@@ -8,7 +8,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Cookie, Depends, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from jose import JWTError, jwt
+import jwt
+from jwt import InvalidTokenError
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
@@ -95,15 +96,18 @@ def _get_admin_user(
         raise login_redirect
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id = payload.get("sub")
-    except JWTError as exc:
+        user_id = int(payload.get("sub"))
+        token_version = int(payload.get("ver", 0))
+    except (InvalidTokenError, TypeError, ValueError) as exc:
         raise login_redirect from exc
 
-    user = db.query(User).filter(User.id == int(user_id)).first()
+    user = db.query(User).filter(User.id == user_id).first()
     if not user or not user.is_active:
         raise login_redirect
     if user.role.name != RoleName.SUPER_ADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super Admin only")
+    if token_version != user.token_version:
+        raise login_redirect
     return user
 
 
@@ -483,7 +487,11 @@ def login_submit(
         return login_page_with_error("Access restricted to active Super Admin accounts.")
     _clear_failures(ip)
 
-    token, expires_in = create_access_token({"sub": str(user.id), "role": user.role.name.value})
+    token, expires_in = create_access_token({
+        "sub": str(user.id),
+        "role": user.role.name.value,
+        "ver": user.token_version,
+    })
     write_audit(db, "BackendAdmin", user.id, "LOGIN", changed_by=user.id, ip_address=get_client_ip(request))
     db.commit()
     response = _redirect("/admin/approval-matrix")
@@ -492,7 +500,9 @@ def login_submit(
         token,
         max_age=expires_in,
         httponly=True,
+        secure=not settings.DEBUG,
         samesite="lax",
+        path="/admin",
     )
     return response
 
@@ -500,7 +510,12 @@ def login_submit(
 @router.get("/logout", include_in_schema=False)
 def logout():
     response = _redirect("/admin/login")
-    response.delete_cookie(ADMIN_COOKIE)
+    response.delete_cookie(
+        ADMIN_COOKIE,
+        path="/admin",
+        secure=not settings.DEBUG,
+        samesite="lax",
+    )
     return response
 
 

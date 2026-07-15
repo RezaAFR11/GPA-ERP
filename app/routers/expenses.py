@@ -28,17 +28,15 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import func, or_
-
-UPLOAD_DIR = Path("uploads/receipts")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-_ALLOWED_TYPES = {
-    "image/jpeg", "image/jpg", "image/png", "image/webp",
-    "image/heic", "image/heif", "application/pdf",
+_EXTENSION_BY_CONTENT_TYPE = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+    "image/webp": ".webp", "image/heic": ".heic", "image/heif": ".heif",
+    "application/pdf": ".pdf",
 }
-_MAX_SIZE = 10 * 1024 * 1024  # 10 MB
 from sqlalchemy.orm import Session, joinedload
 
 from app.audit import model_to_dict, write_audit
+from app.config import get_settings
 from app.database import get_db
 from app.dependencies import (
     CurrentUser, get_client_ip, get_required_approvers_from_matrix, require_role,
@@ -54,6 +52,10 @@ from app.schemas import (
 )
 
 router = APIRouter(prefix="/expenses", tags=["Spending – Expenses"])
+settings = get_settings()
+RECEIPT_UPLOAD_DIR = Path(settings.UPLOAD_DIR) / "receipts"
+RECEIPT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+_MAX_SIZE = settings.MAX_UPLOAD_MB * 1024 * 1024
 
 
 def _get_or_404(expense_id: int, db: Session) -> Expense:
@@ -85,10 +87,15 @@ def list_expenses(
     expense_status: ExpenseStatus | None = Query(None, alias="status"),
     my_queue:       bool                = Query(False, description="Only expenses pending MY role"),
     search:         str | None          = Query(None, description="Search description, vendor, or reference"),
+    currency:       str | None          = Query(None, min_length=3, max_length=3),
     skip:           int = Query(0, ge=0),
     limit:          int = Query(100, ge=1, le=500),
 ):
     q = db.query(Expense)
+    if currency:
+        q = q.join(Project, Expense.project_id == Project.id).filter(
+            Project.currency == currency.upper()
+        )
 
     # STAFF and WORKER can only see their own submissions (confidentiality)
     self_service_roles = {RoleName.STAFF, RoleName.WORKER}
@@ -126,6 +133,8 @@ def get_expense_stats(
     paid_statuses     = {ExpenseStatus.PAID, ExpenseStatus.HARD_LOCKED}
 
     base = db.query(Expense)
+    if current_user.role.name in {RoleName.STAFF, RoleName.WORKER}:
+        base = base.filter(Expense.submitted_by == current_user.id)
     if project_id:
         base = base.filter(Expense.project_id == project_id)
 
@@ -159,18 +168,18 @@ async def upload_receipt(
     current_user: CurrentUser,
     file: UploadFile = File(...),
 ):
-    if file.content_type not in _ALLOWED_TYPES:
+    if file.content_type not in _EXTENSION_BY_CONTENT_TYPE:
         raise HTTPException(
             status_code=400,
             detail=f"File type '{file.content_type}' not allowed. Use JPG, PNG, WebP, HEIC, or PDF.",
         )
     data = await file.read()
     if len(data) > _MAX_SIZE:
-        raise HTTPException(status_code=400, detail="File must be under 10 MB")
+        raise HTTPException(status_code=400, detail=f"File must be under {settings.MAX_UPLOAD_MB} MB")
 
-    ext      = Path(file.filename or "receipt").suffix or ".bin"
-    filename = f"{uuid.uuid4().hex}{ext}"
-    dest     = UPLOAD_DIR / filename
+    ext      = _EXTENSION_BY_CONTENT_TYPE[file.content_type]
+    filename = f"user_{current_user.id}_{uuid.uuid4().hex}{ext}"
+    dest     = RECEIPT_UPLOAD_DIR / filename
     dest.write_bytes(data)
 
     return {"url": f"/uploads/receipts/{filename}", "filename": file.filename}
@@ -184,6 +193,7 @@ def export_expenses(
     status:         str | None = Query(None),
     date_from:      str | None = Query(None),
     date_to:        str | None = Query(None),
+    currency:       str | None = Query(None, min_length=3, max_length=3),
 ):
     q = db.query(Expense)
     self_service_roles = {RoleName.STAFF, RoleName.WORKER}
@@ -191,6 +201,10 @@ def export_expenses(
         q = q.filter(Expense.submitted_by == current_user.id)
     elif project_id:
         q = q.filter(Expense.project_id == project_id)
+    if currency:
+        q = q.join(Project, Expense.project_id == Project.id).filter(
+            Project.currency == currency.upper()
+        )
     if status:
         try:
             q = q.filter(Expense.status == ExpenseStatus(status))
@@ -754,6 +768,12 @@ def expense_audit_trail(
     db:           Annotated[Session, Depends(get_db)],
 ):
     from app.models import AuditLog
+    expense = _get_or_404(expense_id, db)
+    if (
+        current_user.role.name in {RoleName.STAFF, RoleName.WORKER}
+        and expense.submitted_by != current_user.id
+    ):
+        raise HTTPException(status_code=403, detail="Not your expense")
     logs = (
         db.query(AuditLog)
         .filter(AuditLog.entity_type == "Expense", AuditLog.entity_id == expense_id)

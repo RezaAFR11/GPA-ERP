@@ -4,19 +4,21 @@ Endpoints for employees, departments, and job grades.
 """
 import secrets
 import string
+from calendar import monthrange
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel
-from sqlalchemy import func as sql_func, and_
+from sqlalchemy import func as sql_func, and_, or_
 from sqlalchemy.orm import Session
 
 from app.audit import model_to_dict, write_audit
+from app.config import get_settings
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, hash_password, require_role
-from app.menu_permissions import ROLE_PRESETS
+from app.menu_permissions import ROLE_PRESETS, require_menu_access
 from app.models import (
     AppMenu, Department, EmpDocType, Employee, EmployeeDocument, EmployeeStatus, EmploymentType,
     JobGrade, LeaveBalance, LeaveType, Role, RoleName, User, UserMenuPermission, WorkGroup,
@@ -32,9 +34,8 @@ from app.schemas import (
     MessageResponse, PaginatedResponse, UserSummary,
     WorkGroupCreate, WorkGroupResponse, WorkGroupUpdate,
     HolidayCalendarCreate, HolidayCalendarResponse,
-    DataChangeRequestCreate, DataChangeRequestResponse, DataChangeActionRequest,
+    CHANGEABLE_FIELDS, DataChangeRequestCreate, DataChangeRequestResponse, DataChangeActionRequest,
     HrisDashboardStats, HeadcountTrendItem, DeptAttendanceItem, PkwtAlertItem,
-    CHANGEABLE_FIELDS,
 )
 
 
@@ -82,10 +83,27 @@ _account_link_roles = (
 _account_admin_roles = (RoleName.SUPER_ADMIN, RoleName.MD)
 _ga_assignable       = (RoleName.WORKER, RoleName.STAFF)
 
-_UPLOADS_DIR = Path("uploads") / "employee_docs"
+_employee_sensitive_fields = (
+    "nik", "npwp", "email", "phone", "bank_name", "bank_account",
+    "bpjs_tk_no", "bpjs_kes_no",
+)
+
+
+def _employee_for_view(employee: Employee, current_user: User) -> dict:
+    """Redact private HR/payroll data from directory-only viewers."""
+    data = EmployeeResponse.model_validate(employee).model_dump()
+    if current_user.role.name not in _hr_roles:
+        for field in _employee_sensitive_fields:
+            data[field] = None
+        data["documents"] = []
+        data["user"] = None
+    return data
+
+_UPLOAD_ROOT = Path(get_settings().UPLOAD_DIR)
+_UPLOADS_DIR = _UPLOAD_ROOT / "employee_docs"
 _UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-_PHOTO_DIR = Path("uploads") / "employee_photos"
+_PHOTO_DIR = _UPLOAD_ROOT / "employee_photos"
 _PHOTO_DIR.mkdir(parents=True, exist_ok=True)
 
 _ALLOWED_EXTS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -289,7 +307,7 @@ def update_job_grade(
 @router.get("/employees", response_model=PaginatedResponse[EmployeeResponse],
             summary="List employees")
 def list_employees(
-    _:           CurrentUser,
+    current_user: Annotated[User, Depends(require_menu_access("hris_employees"))],
     db:          Annotated[Session, Depends(get_db)],
     search:      str | None  = None,
     dept_id:     int | None  = None,
@@ -303,12 +321,16 @@ def list_employees(
     if search:
         like = f"%{search}%"
         from sqlalchemy import or_
-        q = q.filter(or_(
+        search_fields = [
             Employee.full_name.ilike(like),
             Employee.employee_no.ilike(like),
-            Employee.nik.ilike(like),
-            Employee.email.ilike(like),
-        ))
+        ]
+        if current_user.role.name in _hr_roles:
+            search_fields.extend([
+                Employee.nik.ilike(like),
+                Employee.email.ilike(like),
+            ])
+        q = q.filter(or_(*search_fields))
     if dept_id:
         q = q.filter(Employee.dept_id == dept_id)
     if tipe:
@@ -324,7 +346,10 @@ def list_employees(
 
     total = q.count()
     items = q.order_by(Employee.full_name).offset(skip).limit(limit).all()
-    return PaginatedResponse(items=items, total=total)
+    return PaginatedResponse(
+        items=[_employee_for_view(employee, current_user) for employee in items],
+        total=total,
+    )
 
 
 @router.post("/employees", response_model=EmployeeResponse, status_code=201,
@@ -353,7 +378,7 @@ def create_employee(
                 after=model_to_dict(emp))
     db.commit()
     db.refresh(emp)
-    return emp
+    return _employee_for_view(emp, current_user)
 
 
 @router.get("/employees/linkable-users", response_model=list[UserSummary],
@@ -399,7 +424,7 @@ def link_employee_user(
                 before=before, after=model_to_dict(emp))
     db.commit()
     db.refresh(emp)
-    return emp
+    return _employee_for_view(emp, current_user)
 
 
 @router.post("/employees/from-user/{user_id}", response_model=EmployeeResponse,
@@ -419,7 +444,7 @@ def employee_from_user(
 
     existing = db.query(Employee).filter(Employee.user_id == user_id).first()
     if existing:
-        return existing
+        return _employee_for_view(existing, current_user)
 
     # Link an unlinked employee with the same email, if one exists.
     if user.email:
@@ -434,7 +459,7 @@ def employee_from_user(
                         before=before, after=model_to_dict(match))
             db.commit()
             db.refresh(match)
-            return match
+            return _employee_for_view(match, current_user)
 
     emp = Employee(
         employee_no=_next_employee_no(db),
@@ -452,20 +477,20 @@ def employee_from_user(
                 after=model_to_dict(emp))
     db.commit()
     db.refresh(emp)
-    return emp
+    return _employee_for_view(emp, current_user)
 
 
 @router.get("/employees/{emp_id}", response_model=EmployeeResponse,
             summary="Get employee detail")
 def get_employee(
     emp_id: int,
-    _:      CurrentUser,
+    current_user: Annotated[User, Depends(require_menu_access("hris_employees"))],
     db:     Annotated[Session, Depends(get_db)],
 ):
     emp = db.query(Employee).filter(Employee.id == emp_id).first()
     if not emp:
         raise HTTPException(404, "Employee not found")
-    return emp
+    return _employee_for_view(emp, current_user)
 
 
 @router.patch("/employees/{emp_id}", response_model=EmployeeResponse,
@@ -492,6 +517,14 @@ def update_employee(
     before = model_to_dict(emp)
     for k, v in updates.items():
         setattr(emp, k, v)
+    if emp.status == EmployeeStatus.TERMINATED and emp.user and emp.user.is_active:
+        user_before = model_to_dict(emp.user)
+        emp.user.is_active = False
+        write_audit(
+            db, "User", emp.user.id, "DEACTIVATE_ON_TERMINATION",
+            changed_by=current_user.id, ip_address=get_client_ip(request),
+            before=user_before, after=model_to_dict(emp.user),
+        )
     write_audit(db, "Employee", emp.id, "UPDATE",
                 changed_by=current_user.id, ip_address=get_client_ip(request),
                 before=before, after=model_to_dict(emp))
@@ -713,7 +746,7 @@ def list_work_groups(
     role: str | None = Query(None),
     is_active: bool | None = Query(None),
     db: Session = Depends(get_db),
-    _: User = Depends(require_role(RoleName.SUPER_ADMIN, RoleName.MD, RoleName.GA)),
+    _: User = Depends(require_role(RoleName.SUPER_ADMIN, RoleName.MD, RoleName.GA, RoleName.HR)),
 ):
     q = db.query(WorkGroup)
     if role:
@@ -727,7 +760,7 @@ def list_work_groups(
 def create_work_group(
     body: WorkGroupCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role(RoleName.SUPER_ADMIN, RoleName.MD, RoleName.GA)),
+    current_user: User = Depends(require_role(RoleName.SUPER_ADMIN, RoleName.MD, RoleName.GA, RoleName.HR)),
 ):
     wg = WorkGroup(**body.model_dump())
     db.add(wg)
@@ -741,7 +774,7 @@ def update_work_group(
     wg_id: int,
     body: WorkGroupUpdate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_role(RoleName.SUPER_ADMIN, RoleName.MD, RoleName.GA)),
+    _: User = Depends(require_role(RoleName.SUPER_ADMIN, RoleName.MD, RoleName.GA, RoleName.HR)),
 ):
     wg = db.query(WorkGroup).filter(WorkGroup.id == wg_id).first()
     if not wg:
@@ -758,7 +791,7 @@ def assign_work_group(
     emp_id: int,
     work_group_id: int | None = Query(None, description="Pass null/omit to unassign"),
     db: Session = Depends(get_db),
-    _: User = Depends(require_role(RoleName.SUPER_ADMIN, RoleName.MD, RoleName.GA)),
+    _: User = Depends(require_role(RoleName.SUPER_ADMIN, RoleName.MD, RoleName.GA, RoleName.HR)),
 ):
     emp = db.query(Employee).filter(Employee.id == emp_id).first()
     if not emp:
@@ -793,15 +826,26 @@ def hris_dashboard_stats(
     total_employees = len(all_emps)
     active    = sum(1 for e in all_emps if e.status == EmployeeStatus.ACTIVE)
     probation = sum(1 for e in all_emps if e.status == EmployeeStatus.PROBATION)
+    current_emps = [
+        e for e in all_emps
+        if e.status in (EmployeeStatus.ACTIVE, EmployeeStatus.PROBATION)
+    ]
+    employment_type_counts = {
+        employment_type.value: sum(1 for e in current_emps if e.tipe == employment_type)
+        for employment_type in EmploymentType
+    }
 
     year_start = date(year, 1, 1)
+    report_year_end = min(date(year, 12, 31), today)
     terminated_ytd = sum(
         1 for e in all_emps
-        if e.status == EmployeeStatus.TERMINATED and e.end_date and e.end_date >= year_start
+        if e.status == EmployeeStatus.TERMINATED
+        and e.end_date
+        and year_start <= e.end_date <= report_year_end
     )
     hired_ytd = sum(
         1 for e in all_emps
-        if e.join_date and e.join_date >= year_start
+        if e.join_date and year_start <= e.join_date <= report_year_end
     )
 
     # ── Headcount trend (last 6 months) ──────────────────────────────────────
@@ -816,13 +860,12 @@ def hris_dashboard_stats(
         else:
             yr = today.year
             mn = today.month - i
-        snap_date = date(yr, mn, 1)
-        # employees joined before snap_date and not terminated before snap_date
+        snap_date = date(yr, mn, monthrange(yr, mn)[1])
+        # Employment dates, rather than today's status, define historical headcount.
         count = sum(
             1 for e in all_emps
             if (e.join_date is None or e.join_date <= snap_date)
             and (e.end_date is None or e.end_date >= snap_date)
-            and e.status != EmployeeStatus.TERMINATED
         )
         # Simpler: just count current active + probation for current month
         if mn == today.month and yr == today.year:
@@ -830,7 +873,12 @@ def hris_dashboard_stats(
         trend.append(HeadcountTrendItem(month=f"{yr}-{mn:02d}", count=count))
 
     # ── PKWT expiry alerts ────────────────────────────────────────────────────
-    pkwt_emps = [e for e in all_emps if e.tipe == EmploymentType.PKWT and e.end_date]
+    pkwt_emps = [
+        e for e in all_emps
+        if e.tipe == EmploymentType.PKWT
+        and e.end_date
+        and e.status in (EmployeeStatus.ACTIVE, EmployeeStatus.PROBATION)
+    ]
     def days_left(e: Employee) -> int:
         return (e.end_date - today).days if e.end_date else 9999
 
@@ -861,26 +909,46 @@ def hris_dashboard_stats(
     ).join(LeaveType).filter(LeaveType.is_paid == True).all()
     leave_liability_days = sum(max(0, b.accrued - b.used) for b in balances)
 
-    # ── Attendance rate current month ─────────────────────────────────────────
+    # ── Attendance rate for the selected month ────────────────────────────────
     month_start = date(year, month, 1)
-    # Count distinct attendance dates in this month with at least one employee present
+    month_last = date(year, month, monthrange(year, month)[1])
+    report_end = min(month_last, today)
+    holidays = {
+        row[0] for row in db.query(HolidayCalendar.date).filter(
+            HolidayCalendar.date >= month_start,
+            HolidayCalendar.date <= report_end,
+        ).all()
+    } if report_end >= month_start else set()
+    working_dates = [
+        month_start + timedelta(days=offset)
+        for offset in range((report_end - month_start).days + 1)
+        if (month_start + timedelta(days=offset)).weekday() < 5
+        and (month_start + timedelta(days=offset)) not in holidays
+    ] if report_end >= month_start else []
+
     att_rows = (
         db.query(AttendanceRecord.date, sql_func.count(AttendanceRecord.id))
+        .join(Employee, Employee.id == AttendanceRecord.employee_id)
         .filter(
-            AttendanceRecord.date >= month_start,
-            AttendanceRecord.date <= today,
+            AttendanceRecord.date.in_(working_dates),
             AttendanceRecord.clock_in.isnot(None),
+            or_(Employee.join_date.is_(None), Employee.join_date <= AttendanceRecord.date),
+            or_(Employee.end_date.is_(None), Employee.end_date >= AttendanceRecord.date),
         )
         .group_by(AttendanceRecord.date)
         .all()
     )
 
-    # Working days so far this month (Mon–Fri, before today inclusive)
-    working_days = sum(
-        1 for d in range((today - month_start).days + 1)
-        if (month_start + timedelta(days=d)).weekday() < 5
+    def employed_on(employee: Employee, work_date: date) -> bool:
+        return (
+            (employee.join_date is None or employee.join_date <= work_date)
+            and (employee.end_date is None or employee.end_date >= work_date)
+        )
+
+    expected_total = sum(
+        1 for work_date in working_dates for employee in all_emps
+        if employed_on(employee, work_date)
     )
-    expected_total = working_days * max(active + probation, 1)
     actual_present = sum(cnt for _, cnt in att_rows)
     attendance_rate_pct = round(actual_present / expected_total * 100, 1) if expected_total > 0 else 0.0
 
@@ -889,28 +957,25 @@ def hris_dashboard_stats(
         db.query(Employee.dept_id, sql_func.count(AttendanceRecord.id))
         .join(AttendanceRecord, AttendanceRecord.employee_id == Employee.id)
         .filter(
-            AttendanceRecord.date >= month_start,
-            AttendanceRecord.date <= today,
+            AttendanceRecord.date.in_(working_dates),
             AttendanceRecord.clock_in.isnot(None),
+            or_(Employee.join_date.is_(None), Employee.join_date <= AttendanceRecord.date),
+            or_(Employee.end_date.is_(None), Employee.end_date >= AttendanceRecord.date),
         )
         .group_by(Employee.dept_id)
         .all()
     )
-    dept_emp_counts: dict[int, int] = {}
-    for dept_id, cnt in (
-        db.query(Employee.dept_id, sql_func.count(Employee.id))
-        .filter(Employee.status.in_([EmployeeStatus.ACTIVE, EmployeeStatus.PROBATION]))
-        .filter(Employee.dept_id.isnot(None))
-        .group_by(Employee.dept_id).all()
-    ):
-        dept_emp_counts[dept_id] = cnt
+    dept_expected: dict[int, int] = {}
+    for work_date in working_dates:
+        for employee in all_emps:
+            if employee.dept_id is not None and employed_on(employee, work_date):
+                dept_expected[employee.dept_id] = dept_expected.get(employee.dept_id, 0) + 1
 
     dept_map = {d.id: d.name for d in db.query(Department).all()}
     dept_attendance: list[DeptAttendanceItem] = []
-    for dept_id, present_count in dept_att_rows:
-        if dept_id is None:
-            continue
-        expected = working_days * dept_emp_counts.get(dept_id, 1)
+    dept_present = {dept_id: count for dept_id, count in dept_att_rows if dept_id is not None}
+    for dept_id, expected in dept_expected.items():
+        present_count = dept_present.get(dept_id, 0)
         rate = round(present_count / expected * 100, 1) if expected > 0 else 0.0
         dept_attendance.append(DeptAttendanceItem(
             dept=dept_map.get(dept_id, "Unknown"),
@@ -924,6 +989,7 @@ def hris_dashboard_stats(
         probation=probation,
         terminated_ytd=terminated_ytd,
         hired_ytd=hired_ytd,
+        employment_type_counts=employment_type_counts,
         headcount_trend=trend,
         pkwt_expiring_30d=len(expiring_30),
         pkwt_expiring_60d=len(expiring_60),
@@ -992,60 +1058,18 @@ def delete_holiday(
 # Employee Data Change Requests
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _get_my_employee(db: Session, cu: CurrentUser) -> Employee:
-    emp = db.query(Employee).filter(Employee.user_id == cu.id).first()
-    if not emp:
-        raise HTTPException(404, "No employee profile linked to your account")
-    return emp
-
-
-@router.post("/me/data-change-requests", response_model=DataChangeRequestResponse, status_code=201)
-def submit_data_change_request(
-    payload: DataChangeRequestCreate,
-    cu: CurrentUser,
-    db: Annotated[Session, Depends(get_db)],
-):
-    emp = _get_my_employee(db, cu)
-    if payload.field_name not in CHANGEABLE_FIELDS:
-        raise HTTPException(400, f"Field '{payload.field_name}' is not changeable. Allowed: {sorted(CHANGEABLE_FIELDS)}")
-    old_val = str(getattr(emp, payload.field_name, "") or "")
-    req = EmployeeDataChangeRequest(
-        employee_id=emp.id,
-        field_name=payload.field_name,
-        old_value=old_val,
-        new_value=payload.new_value,
-        reason=payload.reason,
-        status=DataChangeStatus.PENDING,
-    )
-    db.add(req)
-    db.commit()
-    db.refresh(req)
-    return req
-
-
-@router.get("/me/data-change-requests", response_model=list[DataChangeRequestResponse])
-def my_data_change_requests(
-    cu: CurrentUser,
-    db: Annotated[Session, Depends(get_db)],
-):
-    emp = _get_my_employee(db, cu)
-    return (
-        db.query(EmployeeDataChangeRequest)
-        .filter(EmployeeDataChangeRequest.employee_id == emp.id)
-        .order_by(EmployeeDataChangeRequest.created_at.desc())
-        .all()
-    )
-
-
 @router.get("/data-change-requests", response_model=list[DataChangeRequestResponse])
 def list_data_change_requests(
-    cu: Annotated[CurrentUser, Depends(require_role(RoleName.SUPER_ADMIN, RoleName.GA, RoleName.MD))],
+    cu: Annotated[CurrentUser, Depends(require_role(RoleName.SUPER_ADMIN, RoleName.GA, RoleName.HR, RoleName.MD))],
     db: Annotated[Session, Depends(get_db)],
-    status_filter: str | None = Query(None, alias="status"),
+    status_filter: DataChangeStatus | None = Query(None, alias="status"),
+    employee_id: int | None = Query(None),
 ):
     q = db.query(EmployeeDataChangeRequest)
     if status_filter:
         q = q.filter(EmployeeDataChangeRequest.status == status_filter)
+    if employee_id:
+        q = q.filter(EmployeeDataChangeRequest.employee_id == employee_id)
     return q.order_by(EmployeeDataChangeRequest.created_at.desc()).all()
 
 
@@ -1056,16 +1080,45 @@ def approve_data_change(
     cu: Annotated[CurrentUser, Depends(require_role(RoleName.SUPER_ADMIN, RoleName.GA, RoleName.MD))],
     db: Annotated[Session, Depends(get_db)],
 ):
-    req = db.query(EmployeeDataChangeRequest).filter(EmployeeDataChangeRequest.id == req_id).first()
+    req = (
+        db.query(EmployeeDataChangeRequest)
+        .filter(EmployeeDataChangeRequest.id == req_id)
+        .with_for_update()
+        .first()
+    )
     if not req:
         raise HTTPException(404, "Request not found")
     if req.status != DataChangeStatus.PENDING:
         raise HTTPException(400, f"Request is already {req.status.value}")
-    emp = db.query(Employee).filter(Employee.id == req.employee_id).first()
-    if emp and hasattr(emp, req.field_name):
-        setattr(emp, req.field_name, req.new_value)
-        write_audit(db, "Employee", emp.id, "DATA_CHANGE_APPROVED",
-                    changed_by=cu.id, after={req.field_name: req.new_value})
+    if req.field_name not in CHANGEABLE_FIELDS:
+        raise HTTPException(409, "Request contains a field that is not changeable")
+    try:
+        validated = DataChangeRequestCreate(
+            field_name=req.field_name,
+            new_value=req.new_value,
+            reason=req.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, f"Request contains an invalid value: {exc}") from exc
+
+    emp = (
+        db.query(Employee)
+        .filter(Employee.id == req.employee_id)
+        .with_for_update()
+        .first()
+    )
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+    current_value = str(getattr(emp, req.field_name, "") or "")
+    if current_value != (req.old_value or ""):
+        raise HTTPException(
+            409,
+            "Employee data changed after this request was submitted; reject it and submit a new request",
+        )
+
+    setattr(emp, req.field_name, validated.new_value)
+    write_audit(db, "Employee", emp.id, "DATA_CHANGE_APPROVED",
+                changed_by=cu.id, after={req.field_name: validated.new_value})
     req.status = DataChangeStatus.APPROVED
     req.reviewed_by = cu.id
     req.reviewed_at = datetime.now(timezone.utc)
@@ -1082,7 +1135,12 @@ def reject_data_change(
     cu: Annotated[CurrentUser, Depends(require_role(RoleName.SUPER_ADMIN, RoleName.GA, RoleName.MD))],
     db: Annotated[Session, Depends(get_db)],
 ):
-    req = db.query(EmployeeDataChangeRequest).filter(EmployeeDataChangeRequest.id == req_id).first()
+    req = (
+        db.query(EmployeeDataChangeRequest)
+        .filter(EmployeeDataChangeRequest.id == req_id)
+        .with_for_update()
+        .first()
+    )
     if not req:
         raise HTTPException(404, "Request not found")
     if req.status != DataChangeStatus.PENDING:
@@ -1099,49 +1157,3 @@ def reject_data_change(
 # ═══════════════════════════════════════════════════════════════════════════════
 # Employee Documents Hub (self-service)
 # ═══════════════════════════════════════════════════════════════════════════════
-
-@router.get("/me/documents", response_model=list[dict], summary="My downloadable documents")
-def my_documents(
-    cu: CurrentUser,
-    db: Annotated[Session, Depends(get_db)],
-):
-    """Returns employee's own uploaded documents + payslip list combined."""
-    emp = _get_my_employee(db, cu)
-
-    from app.models import PayrollRun, PaySlip, PayrollPeriod
-    items = []
-
-    # Employee documents
-    for doc in emp.documents:
-        items.append({
-            "doc_type":     doc.doc_type.value,
-            "name":         f"Dokumen {doc.doc_type.value}",
-            "date":         doc.uploaded_at.date().isoformat() if doc.uploaded_at else None,
-            "file_url":     doc.file_url,
-            "period_label": None,
-        })
-
-    # Payslips
-    from sqlalchemy.orm import joinedload
-    runs = (
-        db.query(PayrollRun)
-        .join(PaySlip, PayrollRun.id == PaySlip.run_id)
-        .join(PayrollPeriod, PayrollRun.period_id == PayrollPeriod.id)
-        .filter(PayrollRun.employee_id == emp.id)
-        .options(joinedload(PayrollRun.payslip), joinedload(PayrollRun.period))
-        .order_by(PayrollPeriod.year.desc(), PayrollPeriod.month.desc())
-        .all()
-    )
-    MONTH_ID = ["","Januari","Februari","Maret","April","Mei","Juni",
-                "Juli","Agustus","September","Oktober","November","Desember"]
-    for run in runs:
-        if run.payslip:
-            items.append({
-                "doc_type":     "payslip",
-                "name":         f"Slip Gaji {MONTH_ID[run.period.month]} {run.period.year}",
-                "date":         f"{run.period.year}-{run.period.month:02d}-01",
-                "file_url":     f"/api/hris/payroll/runs/{run.id}/slip.pdf",
-                "period_label": f"{MONTH_ID[run.period.month]} {run.period.year}",
-            })
-
-    return items

@@ -12,6 +12,9 @@ from sqlalchemy.orm import Session
 from app.models import AuditLog
 
 
+_SENSITIVE_COLUMNS = {"hashed_password"}
+
+
 def _serialize(obj: Any) -> Any:
     """Recursively make an object JSON-safe."""
     if obj is None:
@@ -35,6 +38,7 @@ def model_to_dict(instance: Any) -> dict:
     return {
         col.key: _serialize(getattr(instance, col.key))
         for col in instance.__table__.columns
+        if col.key not in _SENSITIVE_COLUMNS
     }
 
 

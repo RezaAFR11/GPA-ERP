@@ -2,6 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 # System-level deps for psycopg2 and Pillow
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq-dev \
@@ -19,7 +22,7 @@ COPY . .
 # Uploads directory (will be overridden by volume mount in prod)
 RUN mkdir -p /app/uploads
 
-EXPOSE 8002
+EXPOSE 8000
 
 # Copy and set startup script (runs migrations then starts server)
 COPY start.sh /app/start.sh

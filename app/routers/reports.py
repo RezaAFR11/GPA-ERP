@@ -8,7 +8,7 @@ Endpoints:
 from __future__ import annotations
 
 import io
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Annotated
 
@@ -21,9 +21,10 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.dependencies import CurrentUser, require_role
+from app.menu_permissions import require_menu_access
 from app.models import (
-    Employee, Expense, ExpenseStatus, PayrollPeriod, PayrollRun,
-    Project, ProjectStatus, RoleName,
+    ARStatus, AccountReceivable, Employee, Expense, ExpenseStatus,
+    PayrollPeriod, PayrollRun, Project, ProjectStatus, RoleName,
 )
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
@@ -60,6 +61,85 @@ def _streaming(buf: io.BytesIO, filename: str) -> StreamingResponse:
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.get(
+    "/dashboard-trend",
+    summary="Dashboard monthly finance aggregates",
+    dependencies=[Depends(require_menu_access("dashboard"))],
+)
+def dashboard_trend(
+    current_user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+    currency: str = Query("IDR", min_length=3, max_length=3),
+):
+    currency = currency.upper()
+    today = datetime.now(timezone.utc)
+    start_month = today.month - 5
+    start_year = today.year
+    while start_month <= 0:
+        start_month += 12
+        start_year -= 1
+    start_at = datetime(start_year, start_month, 1, tzinfo=timezone.utc)
+    month_expr_expense = func.to_char(func.date_trunc("month", Expense.created_at), "YYYY-MM")
+    month_expr_revenue = func.to_char(
+        func.date_trunc("month", AccountReceivable.created_at), "YYYY-MM"
+    )
+
+    committed_statuses = (
+        ExpenseStatus.VERIFIED, ExpenseStatus.APPROVED,
+        ExpenseStatus.PAID, ExpenseStatus.HARD_LOCKED,
+    )
+    expense_rows = (
+        db.query(month_expr_expense.label("month"), func.coalesce(func.sum(Expense.amount), 0))
+        .join(Project, Project.id == Expense.project_id)
+        .filter(
+            Project.currency == currency,
+            Expense.status.in_(committed_statuses),
+            Expense.created_at >= start_at,
+        )
+        .group_by(month_expr_expense)
+        .all()
+    )
+    revenue_rows = (
+        db.query(
+            month_expr_revenue.label("month"),
+            func.coalesce(func.sum(AccountReceivable.amount), 0),
+        )
+        .join(Project, Project.id == AccountReceivable.project_id)
+        .filter(
+            Project.currency == currency,
+            AccountReceivable.status == ARStatus.CONFIRMED,
+            AccountReceivable.created_at >= start_at,
+        )
+        .group_by(month_expr_revenue)
+        .all()
+    )
+    expenses_by_month = {row[0]: float(row[1] or 0) for row in expense_rows}
+    revenue_by_month = {row[0]: float(row[1] or 0) for row in revenue_rows}
+    months = sorted(set(expenses_by_month) | set(revenue_by_month))
+
+    pending_expenses = (
+        db.query(func.count(Expense.id))
+        .join(Project, Project.id == Expense.project_id)
+        .filter(
+            Project.currency == currency,
+            Expense.status.in_((ExpenseStatus.SUBMITTED, ExpenseStatus.VERIFIED)),
+        )
+        .scalar()
+        or 0
+    )
+    return {
+        "months": [
+            {
+                "month": month,
+                "spent": expenses_by_month.get(month, 0.0),
+                "revenue": revenue_by_month.get(month, 0.0),
+            }
+            for month in months
+        ],
+        "pending_expenses": pending_expenses,
+    }
 
 
 # ── GET /reports/payroll-summary ──────────────────────────────────────────────

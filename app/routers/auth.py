@@ -35,7 +35,11 @@ def login(
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is disabled")
 
-    token, expires_in = create_access_token({"sub": str(user.id), "role": user.role.name.value})
+    token, expires_in = create_access_token({
+        "sub": str(user.id),
+        "role": user.role.name.value,
+        "ver": user.token_version,
+    })
 
     # Set httpOnly cookie (works for browser clients; Bearer header fallback kept for API/mobile)
     response.set_cookie(
@@ -43,7 +47,7 @@ def login(
         value=token,
         httponly=True,
         secure=not settings.DEBUG,  # False in dev (HTTP), True in prod (HTTPS)
-        samesite="lax",
+        samesite=settings.SESSION_COOKIE_SAMESITE,
         max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         path="/",
     )
@@ -59,7 +63,12 @@ def login(
 
 @router.post("/logout", summary="Clear auth cookie and log out")
 def logout(response: Response):
-    response.delete_cookie("access_token", path="/")
+    response.delete_cookie(
+        "access_token",
+        path="/",
+        secure=not settings.DEBUG,
+        samesite=settings.SESSION_COOKIE_SAMESITE,
+    )
     return {"detail": "Logged out"}
 
 

@@ -80,6 +80,11 @@ ROLE_PRESETS: dict[str, set[str]] = {
 ROLE_PRESETS["HR"] = set(ROLE_PRESETS["GA"])
 ROLE_PRESETS["PROJECT_CONTROL"] = set(ROLE_PRESETS["PM"])
 
+# Every authenticated user needs Settings for their own profile and password.
+# Administrative tabs and endpoints remain protected separately by role guards.
+for _preset in ROLE_PRESETS.values():
+    _preset.add("settings")
+
 
 def ensure_all_roles(db: Session) -> None:
     """Create a Role row for every RoleName enum member that is missing.
@@ -119,7 +124,7 @@ def grant_menu_to_roles(db: Session, menu_key: str, role_names: tuple[RoleName, 
         db.commit()
 
 
-def seed_user_menu_permissions(db: Session, user: User) -> None:
+def seed_user_menu_permissions(db: Session, user: User, *, commit: bool = True) -> None:
     """Seed a single user's menu permissions from their role preset (idempotent).
     Used when a user is created so they have access without waiting for a restart."""
     if user.role.name == RoleName.SUPER_ADMIN:
@@ -136,8 +141,24 @@ def seed_user_menu_permissions(db: Session, user: User) -> None:
         if menu and menu.id not in existing:
             db.add(UserMenuPermission(user_id=user.id, menu_id=menu.id, can_access=True))
             changed = True
-    if changed:
+    if changed and commit:
         db.commit()
+
+
+def reset_user_menu_permissions_for_role(db: Session, user: User) -> None:
+    """Replace role-derived access after a role change in the caller's transaction."""
+    db.query(UserMenuPermission).filter(UserMenuPermission.user_id == user.id).delete(
+        synchronize_session=False
+    )
+    if user.role.name == RoleName.SUPER_ADMIN:
+        return
+
+    menus = {m.key: m for m in db.query(AppMenu).filter(AppMenu.is_active == True).all()}
+    preset_keys = ROLE_PRESETS.get(user.role.name.value, ROLE_PRESETS["STAFF"])
+    for key in preset_keys:
+        menu = menus.get(key)
+        if menu:
+            db.add(UserMenuPermission(user_id=user.id, menu_id=menu.id, can_access=True))
 
 
 def ensure_default_menus(db: Session) -> None:
@@ -187,17 +208,15 @@ def seed_missing_user_permissions(db: Session) -> None:
     for user in users:
         if user.role.name == RoleName.SUPER_ADMIN:
             continue
-        existing = (
-            db.query(UserMenuPermission.id)
+        existing_menu_ids = {
+            row[0] for row in db.query(UserMenuPermission.menu_id)
             .filter(UserMenuPermission.user_id == user.id)
-            .first()
-        )
-        if existing:
-            continue
+            .all()
+        }
         preset_keys = ROLE_PRESETS.get(user.role.name.value, ROLE_PRESETS["STAFF"])
         for key in preset_keys:
             menu = menus.get(key)
-            if menu:
+            if menu and menu.id not in existing_menu_ids:
                 db.add(UserMenuPermission(user_id=user.id, menu_id=menu.id, can_access=True))
                 changed = True
     if changed:
@@ -240,4 +259,5 @@ def require_menu_access(*menu_keys: str):
                 detail=f"Menu access required: {', '.join(menu_keys)}",
             )
         return current_user
+    _check.required_menu_keys = frozenset(menu_keys)  # type: ignore[attr-defined]
     return _check

@@ -25,7 +25,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 # ─── Salary ceilings (per 2024) ───────────────────────────────────────────────
 
-JP_SALARY_CEILING  = Decimal("9_559_600")   # max wage for JP contribution
+JP_SALARY_CEILING  = Decimal("10_547_400")  # current configurable default
 KES_SALARY_CEILING = Decimal("12_000_000")  # max wage for BPJS Kes contribution
 
 # ─── Rates ────────────────────────────────────────────────────────────────────
@@ -50,6 +50,8 @@ def _round(v: Decimal) -> Decimal:
 def calculate_bpjs(
     gross_salary: Decimal,
     jkk_rate:     Decimal | None = None,
+    jp_salary_ceiling: Decimal | None = None,
+    kes_salary_ceiling: Decimal | None = None,
 ) -> dict[str, Decimal]:
     """
     Calculate all BPJS contributions for a given gross monthly salary.
@@ -65,23 +67,28 @@ def calculate_bpjs(
         kes_employee, kes_employer,
         total_employee, total_employer
     """
+    gross = max(Decimal(0), Decimal(gross_salary))
     jkk = jkk_rate if jkk_rate is not None else JKK_RATE
+    jp_ceiling = jp_salary_ceiling if jp_salary_ceiling is not None else JP_SALARY_CEILING
+    kes_ceiling = kes_salary_ceiling if kes_salary_ceiling is not None else KES_SALARY_CEILING
+    if jkk < 0 or jp_ceiling <= 0 or kes_ceiling <= 0:
+        raise ValueError("BPJS rates and salary ceilings must be positive")
 
     # JHT — no ceiling
-    jht_emp  = _round(gross_salary * JHT_EMP_RATE)
-    jht_er   = _round(gross_salary * JHT_EMPLOYER_RATE)
+    jht_emp  = _round(gross * JHT_EMP_RATE)
+    jht_er   = _round(gross * JHT_EMPLOYER_RATE)
 
     # JP — capped
-    jp_base  = min(gross_salary, JP_SALARY_CEILING)
+    jp_base  = min(gross, jp_ceiling)
     jp_emp   = _round(jp_base * JP_EMP_RATE)
     jp_er    = _round(jp_base * JP_EMPLOYER_RATE)
 
     # JKK + JKM (employer only)
-    jkk_er   = _round(gross_salary * jkk)
-    jkm_er   = _round(gross_salary * JKM_RATE)
+    jkk_er   = _round(gross * jkk)
+    jkm_er   = _round(gross * JKM_RATE)
 
     # BPJS Kes — capped
-    kes_base = min(gross_salary, KES_SALARY_CEILING)
+    kes_base = min(gross, kes_ceiling)
     kes_emp  = _round(kes_base * KES_EMP_RATE)
     kes_er   = _round(kes_base * KES_EMPLOYER_RATE)
 

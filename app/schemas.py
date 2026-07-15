@@ -4,13 +4,14 @@ All money fields use Decimal with 2 decimal places.
 """
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, TypeAdapter, field_validator, model_validator
 
 from app.models import (
     ARStatus, CostCodeCategory, DocStatus, DocType,
@@ -108,11 +109,41 @@ class PasswordResetResponse(BaseModel):
     temp_password: str
 
 
+class PasswordChangeResponse(TokenResponse):
+    message: str
+
+
 class UserSummary(ORMBase):
     id:        int
     full_name: str
     email:     str
     role:      RoleResponse
+
+
+class UserListSummary(BaseModel):
+    total: int
+    active: int
+    inactive: int
+
+
+class WorkspaceBrandingResponse(ORMBase):
+    logo: str
+    title: str
+    subtitle: str
+
+
+class WorkspaceBrandingUpdate(BaseModel):
+    logo: str = Field(min_length=1, max_length=12)
+    title: str = Field(min_length=1, max_length=80)
+    subtitle: str = Field(min_length=1, max_length=120)
+
+    @field_validator("logo", "title", "subtitle")
+    @classmethod
+    def strip_branding_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Branding values cannot be blank")
+        return value
 
 
 # ─── Project ─────────────────────────────────────────────────────────────────
@@ -808,7 +839,18 @@ class WorkLocationCreate(BaseModel):
     latitude:      Decimal
     longitude:     Decimal
     radius_meters: int             = Field(default=100, ge=10, le=50000)
+    timezone_name: str             = Field(default="Asia/Jakarta", min_length=1, max_length=64)
     is_active:     bool            = True
+
+    @field_validator("timezone_name")
+    @classmethod
+    def validate_timezone_name(cls, value: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("Unknown IANA timezone name") from exc
+        return value
 
 
 class WorkLocationUpdate(BaseModel):
@@ -817,7 +859,20 @@ class WorkLocationUpdate(BaseModel):
     latitude:      Decimal | None         = None
     longitude:     Decimal | None         = None
     radius_meters: int | None             = Field(None, ge=10, le=50000)
+    timezone_name: str | None             = Field(None, min_length=1, max_length=64)
     is_active:     bool | None            = None
+
+    @field_validator("timezone_name")
+    @classmethod
+    def validate_timezone_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("Unknown IANA timezone name") from exc
+        return value
 
 
 class WorkLocationResponse(ORMBase):
@@ -827,6 +882,7 @@ class WorkLocationResponse(ORMBase):
     latitude:      Decimal
     longitude:     Decimal
     radius_meters: int
+    timezone_name: str
     is_active:     bool
     created_at:    datetime
     updated_at:    datetime
@@ -907,20 +963,31 @@ class AttendanceManualCreate(BaseModel):
     date:                   date
     clock_in:               datetime | None = None
     clock_out:              datetime | None = None
-    hours_regular:          Decimal | None  = None
-    hours_overtime_weekday: Decimal | None  = None
-    hours_overtime_weekend: Decimal | None  = None
-    hours_overtime_holiday: Decimal | None  = None
+    hours_regular:          Decimal | None  = Field(None, ge=0)
+    hours_overtime_weekday: Decimal | None  = Field(None, ge=0)
+    hours_overtime_weekend: Decimal | None  = Field(None, ge=0)
+    hours_overtime_holiday: Decimal | None  = Field(None, ge=0)
     note:                   str | None      = None
+
+    @model_validator(mode="after")
+    def validate_clock_order(self) -> "AttendanceManualCreate":
+        if self.clock_in and self.clock_out and self.clock_out < self.clock_in:
+            raise ValueError("clock_out must be after clock_in")
+        return self
 
 
 class AttendanceSummaryItem(ORMBase):
     employee_id:   int
     employee_no:   str
     full_name:     str
+    department:    str | None = None
     days_present:  int
     hours_regular: Decimal
+    hours_overtime_weekday: Decimal = Decimal(0)
+    hours_overtime_weekend: Decimal = Decimal(0)
+    hours_overtime_holiday: Decimal = Decimal(0)
     hours_ot_total: Decimal
+    total_hours: Decimal = Decimal(0)
 
 
 # ─── Leave Types ─────────────────────────────────────────────────────────────
@@ -970,6 +1037,7 @@ class LeaveRequestCreate(BaseModel):
     start_date:    date
     end_date:      date
     reason:        str | None = None
+    doctor_cert_url: str | None = Field(None, max_length=500)
 
     @model_validator(mode="after")
     def check_dates(self) -> "LeaveRequestCreate":
@@ -990,6 +1058,7 @@ class LeaveRequestResponse(ORMBase):
     end_date:              date
     days:                  int
     reason:                str | None
+    doctor_cert_url:       str | None
     status:                LeaveRequestStatus
     approval_chain:        list | None
     approval_step:         int
@@ -1027,9 +1096,15 @@ class SalaryComponentResponse(ORMBase):
 class SalaryAssignmentCreate(BaseModel):
     employee_id:    int
     component_id:   int
-    amount:         Decimal
+    amount:         Decimal = Field(gt=0)
     effective_from: date
     effective_to:   date | None = None
+
+    @model_validator(mode="after")
+    def validate_effective_range(self) -> "SalaryAssignmentCreate":
+        if self.effective_to and self.effective_to < self.effective_from:
+            raise ValueError("effective_to must be on or after effective_from")
+        return self
 
 
 class SalaryAssignmentResponse(ORMBase):
@@ -1093,8 +1168,8 @@ class PayrollRunResponse(ORMBase):
 
 
 class PayrollRunAdjust(BaseModel):
-    gross_salary:   Decimal | None = None
-    thr_amount:     Decimal | None = None
+    gross_salary:   Decimal | None = Field(None, ge=0)
+    thr_amount:     Decimal | None = Field(None, ge=0)
     pph21_method:   PPh21Method | None = None
     cost_centre_id: int | None = None
 
@@ -1144,6 +1219,7 @@ class ApplicantResponse(ORMBase):
     stage:      ApplicantStage
     cv_url:     str | None
     note:       str | None
+    employee_id: int | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -1181,6 +1257,16 @@ class HireRequest(BaseModel):
     grade_id:       int | None = None
     join_date:      date | None = None
     create_user:    bool = False
+
+
+class HireResponse(BaseModel):
+    applicant:             ApplicantResponse
+    employee_id:           int
+    employee_no:           str
+    user_id:               int | None = None
+    user_email:            str | None = None
+    temp_password:         str | None = None
+    leave_balances_created: int = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1228,6 +1314,7 @@ class HrisDashboardStats(BaseModel):
     probation:           int
     terminated_ytd:      int
     hired_ytd:           int
+    employment_type_counts: dict[str, int]
     # Trend
     headcount_trend:     list[HeadcountTrendItem]
     # PKWT expiry
@@ -1263,7 +1350,15 @@ class HolidayCalendarResponse(ORMBase):
 class OvertimeRequestCreate(BaseModel):
     date:          date
     planned_hours: float = Field(gt=0, le=12)
-    reason:        str = Field(min_length=1)
+    reason:        str = Field(min_length=1, max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Reason cannot be blank")
+        return normalized
 
 class OvertimeRequestResponse(ORMBase):
     id:               int
@@ -1298,8 +1393,43 @@ CHANGEABLE_FIELDS = {
 
 class DataChangeRequestCreate(BaseModel):
     field_name: str = Field(min_length=1, max_length=100)
-    new_value:  str = Field(min_length=1)
-    reason:     str | None = None
+    new_value:  str = Field(min_length=1, max_length=320)
+    reason:     str | None = Field(None, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_field_value(self):
+        self.field_name = self.field_name.strip().lower()
+        self.new_value = self.new_value.strip()
+        self.reason = self.reason.strip() if self.reason else None
+
+        if self.field_name not in CHANGEABLE_FIELDS:
+            raise ValueError(f"Field '{self.field_name}' is not changeable")
+        if not self.new_value:
+            raise ValueError("New value cannot be blank")
+
+        if self.field_name == "email":
+            self.new_value = str(TypeAdapter(EmailStr).validate_python(self.new_value))
+        elif self.field_name == "phone":
+            digits = re.sub(r"\D", "", self.new_value)
+            if (
+                not re.fullmatch(r"\+?[0-9][0-9\s-]*", self.new_value)
+                or not 7 <= len(digits) <= 20
+            ):
+                raise ValueError("Phone number must contain 7-20 digits")
+        elif self.field_name == "bank_name":
+            if not 2 <= len(self.new_value) <= 100:
+                raise ValueError("Bank name must contain 2-100 characters")
+        elif self.field_name == "bank_account":
+            if not re.fullmatch(r"[0-9]{6,50}", self.new_value):
+                raise ValueError("Bank account must contain 6-50 digits")
+        elif self.field_name == "npwp":
+            digits = re.sub(r"\D", "", self.new_value)
+            if not re.fullmatch(r"[0-9.\-\s]+", self.new_value) or len(digits) not in {15, 16}:
+                raise ValueError("NPWP must contain 15 or 16 digits")
+        elif self.field_name in {"bpjs_tk_no", "bpjs_kes_no"}:
+            if not re.fullmatch(r"[0-9]{8,30}", self.new_value):
+                raise ValueError("BPJS number must contain 8-30 digits")
+        return self
 
 class DataChangeRequestResponse(ORMBase):
     id:           int

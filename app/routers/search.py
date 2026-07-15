@@ -9,9 +9,10 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import CurrentUser
+from app.menu_permissions import user_has_menu_access
 from app.models import (
     AccountReceivable, Expense, InventoryItem,
-    LegalDocument, Project,
+    LegalDocument, Project, RoleName,
 )
 
 router = APIRouter(prefix="/search", tags=["Search"])
@@ -28,75 +29,84 @@ def global_search(
 ):
     like = f"%{q}%"
 
-    projects = (
-        db.query(Project.id, Project.code, Project.name, Project.status)
-        .filter(
-            Project.name.ilike(like) | Project.code.ilike(like),
-            Project.is_archived == False,  # noqa: E712
+    projects = []
+    if user_has_menu_access(db, current_user, "project_command"):
+        projects = (
+            db.query(Project.id, Project.code, Project.name, Project.status)
+            .filter(
+                Project.name.ilike(like) | Project.code.ilike(like),
+                Project.is_archived == False,  # noqa: E712
+            )
+            .order_by(Project.code)
+            .limit(limit)
+            .all()
         )
-        .order_by(Project.code)
-        .limit(limit)
-        .all()
-    )
 
-    expenses = (
-        db.query(Expense.id, Expense.description, Expense.amount, Expense.status)
-        .filter(Expense.description.ilike(like))
-        .order_by(Expense.id.desc())
-        .limit(limit)
-        .all()
-    )
+    expenses = []
+    if user_has_menu_access(db, current_user, "spending", "action_center"):
+        expenses_query = db.query(
+            Expense.id, Expense.description, Expense.amount, Expense.status,
+        ).filter(Expense.description.ilike(like))
+        if current_user.role.name in {RoleName.STAFF, RoleName.WORKER}:
+            expenses_query = expenses_query.filter(Expense.submitted_by == current_user.id)
+        expenses = expenses_query.order_by(Expense.id.desc()).limit(limit).all()
 
-    receivables = (
-        db.query(
-            AccountReceivable.id,
-            AccountReceivable.invoice_no,
-            AccountReceivable.customer_name,
-            AccountReceivable.amount,
-            AccountReceivable.status,
+    receivables = []
+    if user_has_menu_access(db, current_user, "revenue_ar"):
+        receivables = (
+            db.query(
+                AccountReceivable.id,
+                AccountReceivable.invoice_no,
+                AccountReceivable.customer_name,
+                AccountReceivable.amount,
+                AccountReceivable.status,
+            )
+            .filter(
+                AccountReceivable.invoice_no.ilike(like)
+                | AccountReceivable.customer_name.ilike(like)
+            )
+            .order_by(AccountReceivable.id.desc())
+            .limit(limit)
+            .all()
         )
-        .filter(
-            AccountReceivable.invoice_no.ilike(like)
-            | AccountReceivable.customer_name.ilike(like)
-        )
-        .order_by(AccountReceivable.id.desc())
-        .limit(limit)
-        .all()
-    )
 
-    legal_docs = (
-        db.query(
-            LegalDocument.id,
-            LegalDocument.doc_number,
-            LegalDocument.title,
-            LegalDocument.doc_type,
-            LegalDocument.status,
+    legal_docs = []
+    if user_has_menu_access(db, current_user, "legal"):
+        legal_docs = (
+            db.query(
+                LegalDocument.id,
+                LegalDocument.doc_number,
+                LegalDocument.title,
+                LegalDocument.doc_type,
+                LegalDocument.status,
+            )
+            .filter(
+                LegalDocument.doc_number.ilike(like) | LegalDocument.title.ilike(like)
+            )
+            .order_by(LegalDocument.created_at.desc())
+            .limit(limit)
+            .all()
         )
-        .filter(
-            LegalDocument.doc_number.ilike(like) | LegalDocument.title.ilike(like)
-        )
-        .order_by(LegalDocument.created_at.desc())
-        .limit(limit)
-        .all()
-    )
 
-    inventory = (
-        db.query(
-            InventoryItem.id,
-            InventoryItem.code,
-            InventoryItem.name,
-            InventoryItem.category,
-            InventoryItem.qty_on_hand,
-            InventoryItem.unit,
+    inventory = []
+    if user_has_menu_access(db, current_user, "inventory"):
+        inventory = (
+            db.query(
+                InventoryItem.id,
+                InventoryItem.code,
+                InventoryItem.name,
+                InventoryItem.category,
+                InventoryItem.qty_on_hand,
+                InventoryItem.unit,
+            )
+            .filter(
+                InventoryItem.name.ilike(like) | InventoryItem.code.ilike(like),
+                InventoryItem.is_active == True,  # noqa: E712
+            )
+            .order_by(InventoryItem.name)
+            .limit(limit)
+            .all()
         )
-        .filter(
-            InventoryItem.name.ilike(like) | InventoryItem.code.ilike(like),
-            InventoryItem.is_active == True,  # noqa: E712
-        )
-        .order_by(InventoryItem.name)
-        .limit(limit)
-        .all()
-    )
 
     def _row(r):
         return dict(zip(r._fields, r))

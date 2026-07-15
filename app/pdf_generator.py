@@ -4,6 +4,7 @@ Overlays typed content (including rich HTML from TipTap) onto the
 company KOP SURAT (letterhead) template.
 """
 import io
+import shutil
 from datetime import datetime
 from decimal import Decimal
 from html.parser import HTMLParser
@@ -18,8 +19,22 @@ from reportlab.lib import colors
 from reportlab.pdfgen import canvas as rl_canvas
 from pypdf import PdfReader, PdfWriter
 
+from app.config import get_settings
+
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "kop_surat.pdf"
-MD_SIGNATURE_PATH = Path(__file__).parent / "templates" / "md_signature.png"
+MD_SIGNATURE_PATH = Path(get_settings().UPLOAD_DIR).resolve() / "system" / "md_signature.png"
+LEGACY_MD_SIGNATURE_PATH = Path(__file__).parent / "templates" / "md_signature.png"
+
+
+def resolve_md_signature_path() -> Path:
+    """Move a legacy bundled signature into configurable persistent storage."""
+    if not MD_SIGNATURE_PATH.exists() and LEGACY_MD_SIGNATURE_PATH.exists():
+        try:
+            MD_SIGNATURE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(LEGACY_MD_SIGNATURE_PATH, MD_SIGNATURE_PATH)
+        except OSError:
+            return LEGACY_MD_SIGNATURE_PATH
+    return MD_SIGNATURE_PATH
 
 # ── Layout constants (A4 = 595.28 × 841.89 pt) ──────────────────────────────
 PAGE_W, PAGE_H = A4
@@ -503,9 +518,10 @@ def generate_document_pdf(
     ln(13)
     c.setFont(FONT_B, 10)
     c.drawString(sig_x, y, "PT GARUDA PRIMA AKSARA")
-    if signed_at and signer_title == "Managing Director" and MD_SIGNATURE_PATH.exists():
+    signature_path = resolve_md_signature_path()
+    if signed_at and signer_title == "Managing Director" and signature_path.exists():
         c.drawImage(
-            str(MD_SIGNATURE_PATH),
+            str(signature_path),
             sig_x,
             y - 48,
             width=118,
@@ -678,7 +694,16 @@ def generate_payslip(
     draw_line_item("BPJS Ketenagakerjaan (Karyawan)", bpjs_tk_employee)
     draw_line_item("BPJS Kesehatan (Karyawan)",       bpjs_kes_employee)
     draw_line_item(f"PPh 21 ({pph21_method})",        pph21_amount)
-    total_deduct = bpjs_tk_employee + bpjs_kes_employee + pph21_amount
+    manual_deductions = Decimal(0)
+    snapshot_items = (components_snapshot or {}).get("components", [])
+    for item in snapshot_items if isinstance(snapshot_items, list) else []:
+        if not isinstance(item, dict) or item.get("component_type") not in ("BPJS", "TAX"):
+            continue
+        amount = Decimal(str(item.get("amount") or 0))
+        if amount > 0:
+            draw_line_item(item.get("component_name") or item.get("component_type"), amount)
+            manual_deductions += amount
+    total_deduct = bpjs_tk_employee + bpjs_kes_employee + pph21_amount + manual_deductions
     draw_line_item("TOTAL POTONGAN", total_deduct, bold=True, bg=(1.0, 0.97, 0.95))
     ln(8)
 

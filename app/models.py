@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     Boolean, Column, Date, DateTime, Enum as SAEnum, ForeignKey,
-    Index, Integer, Numeric, String, Text, UniqueConstraint, func,
+    Index, Integer, Numeric, String, Text, UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.hybrid import hybrid_property
@@ -142,12 +142,13 @@ class User(Base, TimestampMixin):
     __tablename__ = "users"
 
     id:             Mapped[int]  = mapped_column(Integer, primary_key=True)
-    email:          Mapped[str]  = mapped_column(String(320), unique=True, nullable=False, index=True)
+    email:          Mapped[str]  = mapped_column(String(320), nullable=False)
     hashed_password:Mapped[str]  = mapped_column(String(255), nullable=False)
     full_name:      Mapped[str]  = mapped_column(String(255), nullable=False)
     role_id:        Mapped[int]  = mapped_column(ForeignKey("roles.id"), nullable=False)
     is_active:      Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    token_version:  Mapped[int]  = mapped_column(Integer, default=0, nullable=False)
 
     role: Mapped["Role"] = relationship("Role", back_populates="users")
     # Linked HRIS employee (pegawai) record, if any.
@@ -187,6 +188,11 @@ class User(Base, TimestampMixin):
         "Notification", back_populates="user", lazy="dynamic"
     )
 
+    __table_args__ = (
+        UniqueConstraint("email", name="users_email_key"),
+        Index("ix_users_email", "email"),
+    )
+
     def __repr__(self) -> str:
         return f"<User {self.email}>"
 
@@ -195,7 +201,7 @@ class AppMenu(Base, TimestampMixin):
     __tablename__ = "app_menus"
 
     id:          Mapped[int]      = mapped_column(Integer, primary_key=True)
-    key:         Mapped[str]      = mapped_column(String(80), unique=True, nullable=False, index=True)
+    key:         Mapped[str]      = mapped_column(String(80), nullable=False)
     label:       Mapped[str]      = mapped_column(String(120), nullable=False)
     section:     Mapped[str]      = mapped_column(String(80), nullable=False, default="Workspace")
     path:        Mapped[str|None] = mapped_column(String(255), nullable=True)
@@ -208,6 +214,8 @@ class AppMenu(Base, TimestampMixin):
     )
 
     __table_args__ = (
+        UniqueConstraint("key", name="app_menus_key_key"),
+        Index("ix_app_menus_key", "key", unique=True),
         Index("ix_app_menus_section_sort", "section", "sort_order"),
     )
 
@@ -229,13 +237,22 @@ class UserMenuPermission(Base, TimestampMixin):
     )
 
 
+class WorkspaceBranding(Base, TimestampMixin):
+    __tablename__ = "workspace_branding"
+
+    id:       Mapped[int] = mapped_column(Integer, primary_key=True)
+    logo:     Mapped[str] = mapped_column(String(12), nullable=False, default="GP")
+    title:    Mapped[str] = mapped_column(String(80), nullable=False, default="GPA")
+    subtitle: Mapped[str] = mapped_column(String(120), nullable=False, default="Cost Control")
+
+
 # ─── Project ─────────────────────────────────────────────────────────────────
 
 class Project(Base, TimestampMixin):
     __tablename__ = "projects"
 
     id:             Mapped[int]           = mapped_column(Integer, primary_key=True)
-    code:           Mapped[str]           = mapped_column(String(50), unique=True, nullable=False, index=True)
+    code:           Mapped[str]           = mapped_column(String(50), nullable=False)
     name:           Mapped[str]           = mapped_column(String(255), nullable=False)
     contract_value: Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
     currency:       Mapped[str]           = mapped_column(String(3), nullable=False, default="IDR")
@@ -324,6 +341,11 @@ class Project(Base, TimestampMixin):
     def budget(cls):
         return cls.total_revenue - cls.total_committed
 
+    __table_args__ = (
+        UniqueConstraint("code", name="projects_code_key"),
+        Index("ix_projects_code", "code"),
+    )
+
     def __repr__(self) -> str:
         return f"<Project {self.code} — {self.name}>"
 
@@ -334,7 +356,7 @@ class CostCode(Base, TimestampMixin):
     __tablename__ = "cost_codes"
 
     id:        Mapped[int]              = mapped_column(Integer, primary_key=True)
-    code:      Mapped[str]              = mapped_column(String(50), unique=True, nullable=False, index=True)
+    code:      Mapped[str]              = mapped_column(String(50), nullable=False)
     name:      Mapped[str]              = mapped_column(String(255), nullable=False)
     parent_id: Mapped[int|None]         = mapped_column(ForeignKey("cost_codes.id"), nullable=True)
     category:  Mapped[CostCodeCategory] = mapped_column(SAEnum(CostCodeCategory, values_callable=lambda x: [e.value for e in x]), nullable=False)
@@ -344,6 +366,11 @@ class CostCode(Base, TimestampMixin):
     children: Mapped[list["CostCode"]] = relationship("CostCode", back_populates="parent")
     expenses: Mapped[list["Expense"]]  = relationship("Expense", back_populates="cost_code")
     petty_cash_reports: Mapped[list["PettyCashReport"]] = relationship("PettyCashReport", back_populates="cost_code")
+
+    __table_args__ = (
+        UniqueConstraint("code", name="cost_codes_code_key"),
+        Index("ix_cost_codes_code", "code"),
+    )
 
     def __repr__(self) -> str:
         return f"<CostCode {self.code} — {self.name}>"
@@ -355,13 +382,18 @@ class CostCentre(Base, TimestampMixin):
     __tablename__ = "cost_centres"
 
     id:          Mapped[int]      = mapped_column(Integer, primary_key=True)
-    code:        Mapped[str]      = mapped_column(String(50), unique=True, nullable=False, index=True)
+    code:        Mapped[str]      = mapped_column(String(50), nullable=False)
     name:        Mapped[str]      = mapped_column(String(255), nullable=False)
     description: Mapped[str|None] = mapped_column(Text, nullable=True)
     is_active:   Mapped[bool]     = mapped_column(Boolean, default=True, nullable=False)
 
     expenses: Mapped[list["Expense"]] = relationship("Expense", back_populates="cost_centre")
     petty_cash_reports: Mapped[list["PettyCashReport"]] = relationship("PettyCashReport", back_populates="cost_centre")
+
+    __table_args__ = (
+        UniqueConstraint("code", name="cost_centres_code_key"),
+        Index("ix_cost_centres_code", "code", unique=True),
+    )
 
 
 class ProjectDocument(Base, TimestampMixin):
@@ -518,7 +550,7 @@ class PettyCashReport(Base, TimestampMixin):
     __tablename__ = "petty_cash_reports"
 
     id:             Mapped[int]                   = mapped_column(Integer, primary_key=True)
-    report_no:      Mapped[str]                   = mapped_column(String(100), unique=True, nullable=False, index=True)
+    report_no:      Mapped[str]                   = mapped_column(String(100), nullable=False)
     month:          Mapped[str]                   = mapped_column(String(7), nullable=False, index=True)
     project_id:     Mapped[int]                   = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
     cost_code_id:   Mapped[int]                   = mapped_column(ForeignKey("cost_codes.id"), nullable=False)
@@ -542,6 +574,8 @@ class PettyCashReport(Base, TimestampMixin):
     )
 
     __table_args__ = (
+        UniqueConstraint("report_no", name="petty_cash_reports_report_no_key"),
+        Index("ix_petty_cash_reports_report_no", "report_no", unique=True),
         Index("ix_petty_cash_reports_project_month", "project_id", "month"),
         Index("ix_petty_cash_reports_status", "status"),
     )
@@ -645,7 +679,7 @@ class InventoryItem(Base, TimestampMixin):
     __tablename__ = "inventory_items"
 
     id:            Mapped[int]           = mapped_column(Integer, primary_key=True)
-    code:          Mapped[str]           = mapped_column(String(50), unique=True, nullable=False, index=True)
+    code:          Mapped[str]           = mapped_column(String(50), nullable=False)
     name:          Mapped[str]           = mapped_column(String(255), nullable=False)
     category:      Mapped[ItemCategory]  = mapped_column(SAEnum(ItemCategory, values_callable=lambda x: [e.value for e in x]), nullable=False)
     unit:          Mapped[str]           = mapped_column(String(50), nullable=False, default="pcs")
@@ -659,6 +693,7 @@ class InventoryItem(Base, TimestampMixin):
     transactions:  Mapped[list["InventoryTxn"]] = relationship("InventoryTxn", back_populates="item")
 
     __table_args__ = (
+        UniqueConstraint("code", name="inventory_items_code_key"),
         Index("ix_inv_items_category", "category"),
         Index("ix_inv_items_active",   "is_active"),
     )
@@ -671,7 +706,7 @@ class InventoryTxn(Base):
     __tablename__ = "inventory_txns"
 
     id:          Mapped[int]           = mapped_column(Integer, primary_key=True)
-    item_id:     Mapped[int]           = mapped_column(ForeignKey("inventory_items.id"), nullable=False, index=True)
+    item_id:     Mapped[int]           = mapped_column(ForeignKey("inventory_items.id"), nullable=False)
     txn_type:    Mapped[TxnType]       = mapped_column(SAEnum(TxnType, values_callable=lambda x: [e.value for e in x]), nullable=False)
     quantity:    Mapped[Decimal]       = mapped_column(Numeric(18, 3), nullable=False)
     reference:   Mapped[str|None]      = mapped_column(String(255), nullable=True)
@@ -736,8 +771,34 @@ class Notification(Base):
 
     user: Mapped["User"] = relationship("User", back_populates="notifications")
 
+    __table_args__ = (
+        Index("ix_notifications_user_is_read", "user_id", "is_read"),
+        Index("ix_notifications_created_at", text("created_at DESC")),
+    )
+
     def __repr__(self) -> str:
         return f"<Notification {self.id} user={self.user_id} read={self.is_read}>"
+
+
+class EmailOutbox(Base):
+    __tablename__ = "email_outbox"
+
+    id:          Mapped[int]           = mapped_column(Integer, primary_key=True)
+    to_email:    Mapped[str]           = mapped_column(String(320), nullable=False, index=True)
+    subject:     Mapped[str]           = mapped_column(String(200), nullable=False)
+    body_html:   Mapped[str]           = mapped_column(Text, nullable=False)
+    body_text:   Mapped[str|None]      = mapped_column(Text, nullable=True)
+    status:      Mapped[str]           = mapped_column(String(20), nullable=False, default="pending", index=True)
+    attempts:    Mapped[int]           = mapped_column(Integer, nullable=False, default=0)
+    last_error:  Mapped[str|None]      = mapped_column(Text, nullable=True)
+    created_at:  Mapped[datetime]      = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    sent_at:     Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_email_outbox_pending", "status", "created_at"),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -775,7 +836,7 @@ class Department(Base, TimestampMixin):
     __tablename__ = "hris_departments"
 
     id:        Mapped[int]      = mapped_column(Integer, primary_key=True)
-    code:      Mapped[str]      = mapped_column(String(50), unique=True, nullable=False, index=True)
+    code:      Mapped[str]      = mapped_column(String(50), nullable=False)
     name:      Mapped[str]      = mapped_column(String(255), nullable=False)
     parent_id: Mapped[int|None] = mapped_column(ForeignKey("hris_departments.id"), nullable=True)
     is_active: Mapped[bool]     = mapped_column(Boolean, default=True, nullable=False)
@@ -783,6 +844,11 @@ class Department(Base, TimestampMixin):
     parent:   Mapped["Department|None"]  = relationship("Department", remote_side="Department.id", back_populates="children")
     children: Mapped[list["Department"]] = relationship("Department", back_populates="parent")
     employees: Mapped[list["Employee"]]  = relationship("Employee", back_populates="department")
+
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_hris_dept_code"),
+        Index("ix_hris_departments_code", "code"),
+    )
 
     def __repr__(self) -> str:
         return f"<Department {self.code}>"
@@ -794,12 +860,17 @@ class JobGrade(Base, TimestampMixin):
     __tablename__ = "hris_job_grades"
 
     id:        Mapped[int]  = mapped_column(Integer, primary_key=True)
-    code:      Mapped[str]  = mapped_column(String(50), unique=True, nullable=False, index=True)
+    code:      Mapped[str]  = mapped_column(String(50), nullable=False)
     name:      Mapped[str]  = mapped_column(String(255), nullable=False)
     level:     Mapped[int]  = mapped_column(Integer, nullable=False, default=1)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     employees: Mapped[list["Employee"]] = relationship("Employee", back_populates="grade")
+
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_hris_grade_code"),
+        Index("ix_hris_job_grades_code", "code"),
+    )
 
     def __repr__(self) -> str:
         return f"<JobGrade {self.code} L{self.level}>"
@@ -826,6 +897,7 @@ class WorkLocation(Base, TimestampMixin):
     latitude:      Mapped[Decimal]       = mapped_column(Numeric(9, 6), nullable=False)
     longitude:     Mapped[Decimal]       = mapped_column(Numeric(9, 6), nullable=False)
     radius_meters: Mapped[int]           = mapped_column(Integer, nullable=False, default=100)
+    timezone_name: Mapped[str]           = mapped_column(String(64), nullable=False, default="Asia/Jakarta")
     is_active:     Mapped[bool]          = mapped_column(Boolean, nullable=False, default=True)
 
     employees: Mapped[list["Employee"]] = relationship("Employee", back_populates="work_location")
@@ -860,9 +932,9 @@ class Employee(Base, TimestampMixin):
     __tablename__ = "hris_employees"
 
     id:               Mapped[int]            = mapped_column(Integer, primary_key=True)
-    employee_no:      Mapped[str]            = mapped_column(String(50), unique=True, nullable=False, index=True)
+    employee_no:      Mapped[str]            = mapped_column(String(50), nullable=False)
     full_name:        Mapped[str]            = mapped_column(String(255), nullable=False)
-    nik:              Mapped[str|None]       = mapped_column(String(16), unique=True, nullable=True)
+    nik:              Mapped[str|None]       = mapped_column(String(16), nullable=True)
     npwp:             Mapped[str|None]       = mapped_column(String(20), nullable=True)
     email:            Mapped[str|None]       = mapped_column(String(320), nullable=True)
     phone:            Mapped[str|None]       = mapped_column(String(20), nullable=True)
@@ -884,7 +956,7 @@ class Employee(Base, TimestampMixin):
     bank_account:     Mapped[str|None]       = mapped_column(String(50), nullable=True)
     bpjs_tk_no:       Mapped[str|None]       = mapped_column(String(30), nullable=True)
     bpjs_kes_no:      Mapped[str|None]       = mapped_column(String(30), nullable=True)
-    user_id:          Mapped[int|None]       = mapped_column(ForeignKey("users.id"), unique=True, nullable=True)
+    user_id:          Mapped[int|None]       = mapped_column(ForeignKey("users.id"), nullable=True)
     photo_url:        Mapped[str|None]       = mapped_column(String(500), nullable=True)
     # PPh 21 PTKP status — e.g. "TK/0", "K/1". Defaults to TK/0 (single, no dependants).
     ptkp_status:      Mapped[str|None]       = mapped_column(String(10), nullable=True, default="TK/0")
@@ -904,6 +976,10 @@ class Employee(Base, TimestampMixin):
     )
 
     __table_args__ = (
+        UniqueConstraint("employee_no", name="uq_hris_emp_no"),
+        UniqueConstraint("nik", name="uq_hris_emp_nik"),
+        UniqueConstraint("user_id", name="uq_hris_emp_user"),
+        Index("ix_hris_employees_employee_no", "employee_no"),
         Index("ix_hris_employees_dept",          "dept_id"),
         Index("ix_hris_employees_status",        "status"),
         Index("ix_hris_employees_tipe",          "tipe"),
@@ -921,7 +997,9 @@ class EmployeeDocument(Base, TimestampMixin):
     __tablename__ = "hris_employee_documents"
 
     id:          Mapped[int]        = mapped_column(Integer, primary_key=True)
-    employee_id: Mapped[int]        = mapped_column(ForeignKey("hris_employees.id"), nullable=False, index=True)
+    employee_id: Mapped[int]        = mapped_column(
+        ForeignKey("hris_employees.id", ondelete="CASCADE"), nullable=False
+    )
     doc_type:    Mapped[EmpDocType] = mapped_column(
         SAEnum(EmpDocType, values_callable=lambda x: [e.value for e in x]), nullable=False
     )
@@ -931,6 +1009,10 @@ class EmployeeDocument(Base, TimestampMixin):
     )
 
     employee: Mapped["Employee"] = relationship("Employee", back_populates="documents")
+
+    __table_args__ = (
+        Index("ix_hris_employee_documents_emp", "employee_id"),
+    )
 
     def __repr__(self) -> str:
         return f"<EmployeeDocument {self.doc_type} emp={self.employee_id}>"
@@ -967,7 +1049,9 @@ class AttendanceRecord(Base, TimestampMixin):
     __tablename__ = "hris_attendance_records"
 
     id:                     Mapped[int]              = mapped_column(Integer, primary_key=True)
-    employee_id:            Mapped[int]              = mapped_column(ForeignKey("hris_employees.id"), nullable=False, index=True)
+    employee_id:            Mapped[int]              = mapped_column(
+        ForeignKey("hris_employees.id", ondelete="CASCADE"), nullable=False
+    )
     date:                   Mapped[date]             = mapped_column(Date, nullable=False)
     clock_in:               Mapped[datetime|None]    = mapped_column(DateTime(timezone=True), nullable=True)
     clock_out:              Mapped[datetime|None]    = mapped_column(DateTime(timezone=True), nullable=True)
@@ -996,9 +1080,9 @@ class AttendanceRecord(Base, TimestampMixin):
     matched_work_location: Mapped["WorkLocation|None"] = relationship("WorkLocation", foreign_keys=[matched_work_location_id])
 
     __table_args__ = (
-        UniqueConstraint("employee_id", "date", name="uq_attendance_emp_date"),
-        Index("ix_attendance_date",     "date"),
-        Index("ix_attendance_employee", "employee_id"),
+        UniqueConstraint("employee_id", "date", name="uq_attendance_employee_date"),
+        Index("ix_hris_attendance_date", "date"),
+        Index("ix_hris_attendance_employee_id", "employee_id"),
     )
 
     def __repr__(self) -> str:
@@ -1011,20 +1095,29 @@ class LeaveType(Base, TimestampMixin):
     __tablename__ = "hris_leave_types"
 
     id:                  Mapped[int]           = mapped_column(Integer, primary_key=True)
-    code:                Mapped[str]           = mapped_column(String(50), unique=True, nullable=False, index=True)
+    code:                Mapped[str]           = mapped_column(String(50), nullable=False)
     name:                Mapped[str]           = mapped_column(String(255), nullable=False)
     max_days_per_year:   Mapped[int|None]      = mapped_column(Integer, nullable=True)   # null = unlimited
     is_paid:             Mapped[bool]          = mapped_column(Boolean, nullable=False, default=True)
     requires_approval:   Mapped[bool]          = mapped_column(Boolean, nullable=False, default=True)
     is_active:           Mapped[bool]          = mapped_column(Boolean, nullable=False, default=True)
     category:            Mapped[LeaveCategory] = mapped_column(
-        SAEnum(LeaveCategory, values_callable=lambda x: [e.value for e in x]),
+        SAEnum(
+            LeaveCategory,
+            values_callable=lambda x: [e.value for e in x],
+            native_enum=False,
+            length=20,
+        ),
         nullable=False, default=LeaveCategory.ANNUAL
     )
     requires_doctor_cert: Mapped[bool]         = mapped_column(Boolean, nullable=False, default=False)
 
     balances:  Mapped[list["LeaveBalance"]]  = relationship("LeaveBalance",  back_populates="leave_type")
     requests:  Mapped[list["LeaveRequest"]]  = relationship("LeaveRequest",  back_populates="leave_type")
+
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_leave_type_code"),
+    )
 
     def __repr__(self) -> str:
         return f"<LeaveType {self.code}>"
@@ -1036,8 +1129,12 @@ class LeaveBalance(Base, TimestampMixin):
     __tablename__ = "hris_leave_balances"
 
     id:            Mapped[int] = mapped_column(Integer, primary_key=True)
-    employee_id:   Mapped[int] = mapped_column(ForeignKey("hris_employees.id"), nullable=False, index=True)
-    leave_type_id: Mapped[int] = mapped_column(ForeignKey("hris_leave_types.id"), nullable=False, index=True)
+    employee_id:   Mapped[int] = mapped_column(
+        ForeignKey("hris_employees.id", ondelete="CASCADE"), nullable=False
+    )
+    leave_type_id: Mapped[int] = mapped_column(
+        ForeignKey("hris_leave_types.id", ondelete="CASCADE"), nullable=False
+    )
     year:          Mapped[int] = mapped_column(Integer, nullable=False)
     accrued:       Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # days granted
     used:          Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # days taken
@@ -1046,8 +1143,11 @@ class LeaveBalance(Base, TimestampMixin):
     leave_type: Mapped["LeaveType"] = relationship("LeaveType", back_populates="balances")
 
     __table_args__ = (
-        UniqueConstraint("employee_id", "leave_type_id", "year", name="uq_leave_balance"),
-        Index("ix_leave_balance_emp_year", "employee_id", "year"),
+        UniqueConstraint(
+            "employee_id", "leave_type_id", "year",
+            name="uq_leave_balance_emp_type_year",
+        ),
+        Index("ix_hris_leave_balances_employee_id", "employee_id"),
     )
 
     @property
@@ -1064,12 +1164,15 @@ class LeaveRequest(Base, TimestampMixin):
     __tablename__ = "hris_leave_requests"
 
     id:                    Mapped[int]               = mapped_column(Integer, primary_key=True)
-    employee_id:           Mapped[int]               = mapped_column(ForeignKey("hris_employees.id"), nullable=False, index=True)
+    employee_id:           Mapped[int]               = mapped_column(
+        ForeignKey("hris_employees.id", ondelete="CASCADE"), nullable=False
+    )
     leave_type_id:         Mapped[int]               = mapped_column(ForeignKey("hris_leave_types.id"), nullable=False)
     start_date:            Mapped[date]              = mapped_column(Date, nullable=False)
     end_date:              Mapped[date]              = mapped_column(Date, nullable=False)
     days:                  Mapped[int]               = mapped_column(Integer, nullable=False)
     reason:                Mapped[str|None]          = mapped_column(Text, nullable=True)
+    doctor_cert_url:       Mapped[str|None]          = mapped_column(String(500), nullable=True)
     status:                Mapped[LeaveRequestStatus] = mapped_column(
         SAEnum(LeaveRequestStatus, values_callable=lambda x: [e.value for e in x]),
         nullable=False, default=LeaveRequestStatus.DRAFT
@@ -1078,17 +1181,17 @@ class LeaveRequest(Base, TimestampMixin):
     approval_step:         Mapped[int]               = mapped_column(Integer, nullable=False, default=0)
     current_approver_role: Mapped[str|None]          = mapped_column(String(50), nullable=True)
     approval_history:      Mapped[list|None]         = mapped_column(JSONB, nullable=True, default=list)
-    submitted_by:          Mapped[int]               = mapped_column(ForeignKey("users.id"), nullable=False)
+    submitted_by:          Mapped[int|None]          = mapped_column(ForeignKey("users.id"), nullable=True)
     approved_by:           Mapped[int|None]          = mapped_column(ForeignKey("users.id"), nullable=True)
 
     employee:   Mapped["Employee"]   = relationship("Employee",  foreign_keys=[employee_id])
     leave_type: Mapped["LeaveType"]  = relationship("LeaveType", back_populates="requests")
-    submitter:  Mapped["User"]       = relationship("User", foreign_keys=[submitted_by])
+    submitter:  Mapped["User|None"]  = relationship("User", foreign_keys=[submitted_by])
     approver:   Mapped["User|None"]  = relationship("User", foreign_keys=[approved_by])
 
     __table_args__ = (
-        Index("ix_leave_requests_emp",    "employee_id"),
-        Index("ix_leave_requests_status", "status"),
+        Index("ix_hris_leave_requests_employee_id", "employee_id"),
+        Index("ix_hris_leave_requests_status", "status"),
     )
 
     def __repr__(self) -> str:
@@ -1143,7 +1246,9 @@ class SalaryAssignment(Base, TimestampMixin):
     __tablename__ = "hris_salary_assignments"
 
     id:             Mapped[int]             = mapped_column(Integer, primary_key=True)
-    employee_id:    Mapped[int]             = mapped_column(ForeignKey("hris_employees.id"), nullable=False, index=True)
+    employee_id:    Mapped[int]             = mapped_column(
+        ForeignKey("hris_employees.id", ondelete="CASCADE"), nullable=False
+    )
     component_id:   Mapped[int]             = mapped_column(ForeignKey("hris_salary_components.id"), nullable=False)
     amount:         Mapped[Decimal]         = mapped_column(Numeric(18, 2), nullable=False)
     effective_from: Mapped[date]            = mapped_column(Date, nullable=False)
@@ -1151,6 +1256,14 @@ class SalaryAssignment(Base, TimestampMixin):
 
     employee:  Mapped["Employee"]        = relationship("Employee", back_populates="salary_assignments")
     component: Mapped["SalaryComponent"] = relationship("SalaryComponent", back_populates="assignments")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "employee_id", "component_id", "effective_from",
+            name="uq_salary_assignment_effective_start",
+        ),
+        Index("ix_salary_assignments_emp", "employee_id"),
+    )
 
     def __repr__(self) -> str:
         return f"<SalaryAssignment emp={self.employee_id} comp={self.component_id}>"
@@ -1184,8 +1297,8 @@ class PayrollRun(Base, TimestampMixin):
     __tablename__ = "hris_payroll_runs"
 
     id:                  Mapped[int]           = mapped_column(Integer, primary_key=True)
-    period_id:           Mapped[int]           = mapped_column(ForeignKey("hris_payroll_periods.id"), nullable=False, index=True)
-    employee_id:         Mapped[int]           = mapped_column(ForeignKey("hris_employees.id"),       nullable=False, index=True)
+    period_id:           Mapped[int]           = mapped_column(ForeignKey("hris_payroll_periods.id"), nullable=False)
+    employee_id:         Mapped[int]           = mapped_column(ForeignKey("hris_employees.id"),       nullable=False)
     gross_salary:        Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=0)
     bpjs_tk_employee:    Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=0)
     bpjs_tk_employer:    Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=0)
@@ -1206,7 +1319,11 @@ class PayrollRun(Base, TimestampMixin):
     employee:  Mapped["Employee"]      = relationship("Employee")
     payslip:   Mapped["PaySlip|None"]  = relationship("PaySlip", back_populates="run", uselist=False)
 
-    __table_args__ = (UniqueConstraint("period_id", "employee_id", name="uq_payroll_run_period_emp"),)
+    __table_args__ = (
+        UniqueConstraint("period_id", "employee_id", name="uq_payroll_run_period_emp"),
+        Index("ix_payroll_runs_period_id", "period_id"),
+        Index("ix_payroll_runs_employee_id", "employee_id"),
+    )
 
     def __repr__(self) -> str:
         return f"<PayrollRun period={self.period_id} emp={self.employee_id}>"
@@ -1293,7 +1410,9 @@ class Applicant(Base, TimestampMixin):
     __tablename__ = "hris_applicants"
 
     id:         Mapped[int]             = mapped_column(Integer, primary_key=True)
-    posting_id: Mapped[int]             = mapped_column(ForeignKey("hris_job_postings.id"), nullable=False, index=True)
+    posting_id: Mapped[int]             = mapped_column(
+        ForeignKey("hris_job_postings.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     full_name:  Mapped[str]             = mapped_column(String(200), nullable=False)
     email:      Mapped[str|None]        = mapped_column(String(200), nullable=True)
     phone:      Mapped[str|None]        = mapped_column(String(30),  nullable=True)
@@ -1307,10 +1426,18 @@ class Applicant(Base, TimestampMixin):
     )
     cv_url:     Mapped[str|None]        = mapped_column(String(500), nullable=True)
     note:       Mapped[str|None]        = mapped_column(Text, nullable=True)
+    employee_id: Mapped[int|None]       = mapped_column(
+        ForeignKey("hris_employees.id"), unique=True, nullable=True,
+    )
 
     posting:    Mapped["JobPosting"]        = relationship("JobPosting", back_populates="applicants")
     interviews: Mapped[list["Interview"]]   = relationship("Interview", back_populates="applicant")
     onboarding: Mapped[list["OnboardingTask"]] = relationship("OnboardingTask", back_populates="applicant")
+    employee:   Mapped["Employee|None"] = relationship("Employee", foreign_keys=[employee_id])
+
+    __table_args__ = (
+        Index("ix_hris_applicants_stage", "stage"),
+    )
 
     def __repr__(self) -> str:
         return f"<Applicant '{self.full_name}' {self.stage}>"
@@ -1321,7 +1448,9 @@ class Interview(Base, TimestampMixin):
     __tablename__ = "hris_interviews"
 
     id:             Mapped[int]             = mapped_column(Integer, primary_key=True)
-    applicant_id:   Mapped[int]             = mapped_column(ForeignKey("hris_applicants.id"), nullable=False, index=True)
+    applicant_id:   Mapped[int]             = mapped_column(
+        ForeignKey("hris_applicants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     scheduled_at:   Mapped[datetime]        = mapped_column(DateTime(timezone=True), nullable=False)
     interviewer_id: Mapped[int|None]        = mapped_column(ForeignKey("users.id"), nullable=True)
     result:         Mapped[InterviewResult] = mapped_column(
@@ -1342,7 +1471,9 @@ class OnboardingTask(Base, TimestampMixin):
     __tablename__ = "hris_onboarding_tasks"
 
     id:           Mapped[int]       = mapped_column(Integer, primary_key=True)
-    applicant_id: Mapped[int]       = mapped_column(ForeignKey("hris_applicants.id"), nullable=False, index=True)
+    applicant_id: Mapped[int]       = mapped_column(
+        ForeignKey("hris_applicants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     task:         Mapped[str]       = mapped_column(String(300), nullable=False)
     is_completed: Mapped[bool]      = mapped_column(Boolean, nullable=False, default=False)
     completed_at: Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1371,6 +1502,11 @@ class HolidayCalendar(Base, TimestampMixin):
     name:        Mapped[str]      = mapped_column(String(255), nullable=False)
     is_national: Mapped[bool]     = mapped_column(Boolean, nullable=False, default=True)
     year:        Mapped[int]      = mapped_column(Integer, nullable=False, index=True)
+
+    __table_args__ = (
+        Index("ix_holiday_date", "date"),
+        Index("ix_holiday_year", "year"),
+    )
 
     def __repr__(self) -> str:
         return f"<HolidayCalendar {self.date} {self.name}>"

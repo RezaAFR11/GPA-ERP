@@ -10,7 +10,8 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordBearer
-from jose import JWTError, jwt
+import jwt
+from jwt import InvalidTokenError
 from passlib.context import CryptContext
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -93,14 +94,33 @@ async def get_current_user(
         user_id: str | None = payload.get("sub")
         if user_id is None:
             raise credentials_exc
-    except JWTError:
+        token_version = int(payload.get("ver", 0))
+        parsed_user_id = int(user_id)
+    except (InvalidTokenError, TypeError, ValueError):
         raise credentials_exc
 
-    user = db.query(User).filter(User.id == int(user_id)).first()
+    user = db.query(User).filter(User.id == parsed_user_id).first()
     if user is None or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive",
+        )
+    if token_version != user.token_version:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session has expired. Please sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    password_change_allowlist = {
+        "/api/auth/me",
+        "/api/auth/menu-permissions",
+        "/api/users/me/password",
+    }
+    if user.must_change_password and request.url.path not in password_change_allowlist:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password change required before accessing this resource",
         )
     return user
 

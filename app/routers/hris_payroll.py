@@ -17,25 +17,36 @@ from __future__ import annotations
 import csv
 import io
 import logging
+from calendar import monthrange
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
-from sqlalchemy import func as sql_func
+from sqlalchemy import and_, func as sql_func, or_
 from sqlalchemy.orm import Session
 
 from app.audit import write_audit
+from app.config import get_settings
 from app.database import get_db
 from app.dependencies import CurrentUser, get_current_user
 from sqlalchemy.orm import joinedload
 
 from app.hris_bpjs import calculate_bpjs
-from app.hris_tax import calculate_pph21_netto, calculate_pph21_gross_up, DEFAULT_PTKP
+from app.hris_tax import (
+    DEFAULT_PTKP,
+    calculate_pph21_final_gross_up,
+    calculate_pph21_final_period,
+    calculate_pph21_gross_up,
+    calculate_pph21_ter,
+    ter_category,
+    ter_rate,
+)
 from app.models import (
-    AttendanceRecord, Employee, PayrollPeriod, PayrollRun, PaySlip,
+    AttendanceRecord, Employee, EmployeeStatus, OvertimeRequest, OvertimeRequestStatus,
+    PayrollPeriod, PayrollRun, PaySlip,
     SalaryAssignment, SalaryComponent,
     PayrollStatus, PPh21Method, SalaryComponentType, RoleName, effective_roles,
 )
@@ -50,6 +61,7 @@ from app.schemas import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["HRIS Payroll"])
+settings = get_settings()
 
 _HR_ROLES      = (RoleName.SUPER_ADMIN, RoleName.MD)
 _FINANCE_ROLES = (RoleName.SUPER_ADMIN, RoleName.MD, RoleName.FINANCE)
@@ -58,6 +70,230 @@ _FINANCE_ROLES = (RoleName.SUPER_ADMIN, RoleName.MD, RoleName.FINANCE)
 def _require(cu: Employee, roles: tuple) -> None:
     if not any(r in roles for r in effective_roles(cu.role.name)):
         raise HTTPException(403, f"Requires one of: {[r.value for r in roles]}")
+
+
+def _calculate_net_pay(
+    gross_salary: Decimal,
+    tax_allowance: Decimal,
+    bpjs_employee: Decimal,
+    pph21_amount: Decimal,
+    thr_amount: Decimal | None,
+) -> Decimal:
+    net = gross_salary + tax_allowance + (thr_amount or Decimal(0)) - bpjs_employee - pph21_amount
+    return max(Decimal(0), net)
+
+
+def _period_bounds(period: PayrollPeriod) -> tuple[date, date, date]:
+    start = date(period.year, period.month, 1)
+    end_inclusive = date(period.year, period.month, monthrange(period.year, period.month)[1])
+    return start, end_inclusive, end_inclusive + timedelta(days=1)
+
+
+def _eligible_employees(db: Session, period: PayrollPeriod) -> list[Employee]:
+    """Employees whose employment overlaps the payroll period."""
+    period_start, period_end, _ = _period_bounds(period)
+    return (
+        db.query(Employee)
+        .filter(or_(Employee.join_date.is_(None), Employee.join_date <= period_end))
+        .filter(or_(Employee.end_date.is_(None), Employee.end_date >= period_start))
+        .filter(or_(
+            Employee.status != EmployeeStatus.TERMINATED,
+            Employee.end_date >= period_start,
+        ))
+        .order_by(Employee.id)
+        .all()
+    )
+
+
+def _calculate_bpjs(gross_salary: Decimal) -> dict[str, Decimal]:
+    return calculate_bpjs(
+        gross_salary,
+        jkk_rate=settings.BPJS_JKK_RATE,
+        jp_salary_ceiling=settings.BPJS_JP_SALARY_CEILING,
+        kes_salary_ceiling=settings.BPJS_KES_SALARY_CEILING,
+    )
+
+
+def _prior_tax_context(
+    db: Session,
+    employee_id: int,
+    period: PayrollPeriod,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Return prior taxable gross, deductible contributions, and PPh 21 YTD."""
+    rows = (
+        db.query(PayrollRun)
+        .join(PayrollPeriod, PayrollRun.period_id == PayrollPeriod.id)
+        .filter(
+            PayrollRun.employee_id == employee_id,
+            PayrollPeriod.year == period.year,
+            PayrollPeriod.month < period.month,
+        )
+        .all()
+    )
+    gross = Decimal(0)
+    contributions = Decimal(0)
+    tax = Decimal(0)
+    for row in rows:
+        snapshot = row.components_snapshot or {}
+        gross += Decimal(str(snapshot.get(
+            "taxable_gross",
+            Decimal(row.gross_salary or 0)
+            + Decimal(row.thr_amount or 0)
+            + Decimal(str(snapshot.get("tunjangan_pajak", 0))),
+        )))
+        contributions += Decimal(str(snapshot.get(
+            "tax_retirement_contribution",
+            row.bpjs_tk_employee or 0,
+        )))
+        tax += Decimal(row.pph21_amount or 0)
+    return gross, contributions, tax
+
+
+def _calculate_period_tax(
+    db: Session,
+    employee: Employee,
+    period: PayrollPeriod,
+    taxable_gross: Decimal,
+    retirement_contribution: Decimal,
+    method: PPh21Method,
+) -> tuple[Decimal, Decimal, dict]:
+    """Calculate TER or final-period reconciliation and return audit metadata."""
+    ptkp_status = employee.ptkp_status or DEFAULT_PTKP
+    period_start, period_end, _ = _period_bounds(period)
+    is_final_period = period.month == 12 or bool(
+        employee.end_date and period_start <= employee.end_date <= period_end
+    )
+    prior_gross, prior_contributions, prior_tax = _prior_tax_context(
+        db, employee.id, period,
+    )
+
+    if is_final_period:
+        annual_gross = prior_gross + taxable_gross
+        annual_contributions = prior_contributions + retirement_contribution
+        if method == PPh21Method.GROSS_UP:
+            allowance, tax = calculate_pph21_final_gross_up(
+                annual_gross,
+                prior_tax,
+                ptkp_status,
+                annual_contributions,
+            )
+        else:
+            allowance = Decimal(0)
+            tax = calculate_pph21_final_period(
+                annual_gross,
+                prior_tax,
+                ptkp_status,
+                annual_contributions,
+            )
+        metadata = {
+            "tax_scheme": "ARTICLE_17_FINAL",
+            "is_final_tax_period": True,
+            "annual_taxable_gross": float(annual_gross + allowance),
+            "annual_retirement_contribution": float(annual_contributions),
+            "prior_tax_withheld": float(prior_tax),
+        }
+    elif method == PPh21Method.GROSS_UP:
+        allowance, tax = calculate_pph21_gross_up(taxable_gross, ptkp_status)
+        metadata = {
+            "tax_scheme": "TER",
+            "is_final_tax_period": False,
+            "ter_category": ter_category(ptkp_status),
+            "ter_rate": float(ter_rate(taxable_gross + allowance, ptkp_status)),
+        }
+    else:
+        allowance = Decimal(0)
+        tax = calculate_pph21_ter(taxable_gross, ptkp_status)
+        metadata = {
+            "tax_scheme": "TER",
+            "is_final_tax_period": False,
+            "ter_category": ter_category(ptkp_status),
+            "ter_rate": float(ter_rate(taxable_gross, ptkp_status)),
+        }
+
+    metadata["ptkp_status"] = ptkp_status
+    return allowance, tax, metadata
+
+
+def _validate_period_complete(db: Session, period: PayrollPeriod) -> list[PayrollRun]:
+    eligible = _eligible_employees(db, period)
+    runs = db.query(PayrollRun).filter_by(period_id=period.id).all()
+    eligible_ids = {employee.id for employee in eligible}
+    run_ids = {run.employee_id for run in runs}
+    missing = [employee.employee_no for employee in eligible if employee.id not in run_ids]
+    extra = sorted(run_ids - eligible_ids)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append("missing payroll: " + ", ".join(missing))
+        if extra:
+            details.append("ineligible employee IDs: " + ", ".join(map(str, extra)))
+        raise HTTPException(409, "Payroll period is incomplete (" + "; ".join(details) + ")")
+    if not runs:
+        raise HTTPException(409, "Payroll period has no eligible employee runs")
+    return runs
+
+
+def _cap_overtime_hours(
+    weekday: Decimal,
+    weekend: Decimal,
+    holiday: Decimal,
+    approved_hours: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Cap actual attendance overtime to the hours approved for that date."""
+    remaining = max(Decimal(0), approved_hours)
+    paid: list[Decimal] = []
+    for actual in (weekday, weekend, holiday):
+        value = min(max(Decimal(0), actual), remaining)
+        paid.append(value)
+        remaining -= value
+    return paid[0], paid[1], paid[2]
+
+
+def _backfill_approved_overtime_attendance_links(
+    db: Session,
+    employee_ids: list[int],
+    period_start: date,
+    period_end: date,
+) -> int:
+    """Link legacy approved overtime requests to attendance by employee/date."""
+    requests = (
+        db.query(OvertimeRequest)
+        .filter(
+            OvertimeRequest.employee_id.in_(employee_ids),
+            OvertimeRequest.status == OvertimeRequestStatus.APPROVED,
+            OvertimeRequest.attendance_id.is_(None),
+            OvertimeRequest.date >= period_start,
+            OvertimeRequest.date < period_end,
+        )
+        .all()
+    )
+    if not requests:
+        return 0
+
+    keys = {(request.employee_id, request.date) for request in requests}
+    attendances = (
+        db.query(AttendanceRecord)
+        .filter(
+            AttendanceRecord.employee_id.in_(employee_ids),
+            AttendanceRecord.date >= period_start,
+            AttendanceRecord.date < period_end,
+        )
+        .all()
+    )
+    attendance_by_key = {
+        (attendance.employee_id, attendance.date): attendance.id
+        for attendance in attendances
+        if (attendance.employee_id, attendance.date) in keys
+    }
+    linked = 0
+    for request in requests:
+        attendance_id = attendance_by_key.get((request.employee_id, request.date))
+        if attendance_id is not None:
+            request.attendance_id = attendance_id
+            linked += 1
+    if linked:
+        db.flush()
+    return linked
 
 
 # ─── Salary Components ────────────────────────────────────────────────────────
@@ -83,7 +319,10 @@ def create_salary_component(
     comp = SalaryComponent(**body.model_dump())
     db.add(comp)
     db.flush()
-    write_audit(db, cu.id, "CREATE", "hris_salary_components", comp.id, None, body.model_dump())
+    write_audit(
+        db, "hris_salary_components", comp.id, "CREATE",
+        changed_by=cu.id, after=body.model_dump(),
+    )
     db.commit()
     db.refresh(comp)
     return comp
@@ -97,6 +336,7 @@ def list_salary_assignments(
     db: Annotated[Session, Depends(get_db)],
     employee_id: int | None = None,
 ):
+    _require(cu, _HR_ROLES + _FINANCE_ROLES)
     q = db.query(SalaryAssignment)
     if employee_id:
         q = q.filter_by(employee_id=employee_id)
@@ -114,11 +354,35 @@ def create_salary_assignment(
     comp = db.get(SalaryComponent, body.component_id)
     if not emp:  raise HTTPException(404, "Employee not found")
     if not comp: raise HTTPException(404, "Salary component not found")
+    if not comp.is_active:
+        raise HTTPException(409, "Salary component is inactive")
+
+    overlap = (
+        db.query(SalaryAssignment)
+        .filter(
+            SalaryAssignment.employee_id == body.employee_id,
+            SalaryAssignment.component_id == body.component_id,
+            SalaryAssignment.effective_from <= (body.effective_to or date.max),
+            or_(
+                SalaryAssignment.effective_to.is_(None),
+                SalaryAssignment.effective_to >= body.effective_from,
+            ),
+        )
+        .first()
+    )
+    if overlap:
+        raise HTTPException(
+            409,
+            "This employee already has an overlapping assignment for the same salary component",
+        )
 
     asgn = SalaryAssignment(**body.model_dump())
     db.add(asgn)
     db.flush()
-    write_audit(db, cu.id, "CREATE", "hris_salary_assignments", asgn.id, None, body.model_dump(mode="json"))
+    write_audit(
+        db, "hris_salary_assignments", asgn.id, "CREATE",
+        changed_by=cu.id, after=body.model_dump(mode="json"),
+    )
     db.commit()
     db.refresh(asgn)
     return asgn
@@ -136,7 +400,10 @@ def delete_salary_assignment(
         raise HTTPException(404, "Assignment not found")
     db.delete(asgn)
     db.flush()
-    write_audit(db, cu.id, "DELETE", "hris_salary_assignments", asgn_id, None, None)
+    write_audit(
+        db, "hris_salary_assignments", asgn_id, "DELETE",
+        changed_by=cu.id,
+    )
     db.commit()
 
 
@@ -147,6 +414,7 @@ def list_periods(
     cu: CurrentUser,
     db: Annotated[Session, Depends(get_db)],
 ):
+    _require(cu, _HR_ROLES + _FINANCE_ROLES)
     return db.query(PayrollPeriod).order_by(PayrollPeriod.year.desc(), PayrollPeriod.month.desc()).all()
 
 
@@ -164,9 +432,13 @@ def create_period(
         raise HTTPException(400, f"Period {body.year}-{body.month:02d} already exists")
     period = PayrollPeriod(year=body.year, month=body.month, status=PayrollStatus.OPEN)
     db.add(period)
+    db.flush()
+    write_audit(
+        db, "hris_payroll_periods", period.id, "CREATE",
+        changed_by=cu.id, after=body.model_dump(),
+    )
     db.commit()
     db.refresh(period)
-    write_audit(db, cu.id, "CREATE", "hris_payroll_periods", period.id, None, body.model_dump())
     return period
 
 
@@ -182,12 +454,45 @@ def lock_period(
         raise HTTPException(404, "Period not found")
     if period.status != PayrollStatus.OPEN:
         raise HTTPException(400, f"Period is already {period.status}")
+    _validate_period_complete(db, period)
     period.status    = PayrollStatus.LOCKED
     period.locked_at = datetime.now(timezone.utc)
     period.locked_by = cu.id
+    write_audit(
+        db, "hris_payroll_periods", period.id, "LOCK",
+        changed_by=cu.id,
+        before={"status": PayrollStatus.OPEN.value},
+        after={"status": PayrollStatus.LOCKED.value},
+    )
     db.commit()
     db.refresh(period)
-    write_audit(db, cu.id, "LOCK", "hris_payroll_periods", period.id, None, None)
+    return period
+
+
+@router.post("/hris/payroll/periods/{period_id}/unlock", response_model=PayrollPeriodResponse)
+def unlock_period(
+    period_id: int,
+    cu: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """Return a locked, unposted period to OPEN for controlled corrections."""
+    _require(cu, _HR_ROLES)
+    period = db.get(PayrollPeriod, period_id)
+    if not period:
+        raise HTTPException(404, "Period not found")
+    if period.status != PayrollStatus.LOCKED:
+        raise HTTPException(409, "Only a LOCKED period can be unlocked")
+    period.status = PayrollStatus.OPEN
+    period.locked_at = None
+    period.locked_by = None
+    write_audit(
+        db, "hris_payroll_periods", period.id, "UNLOCK",
+        changed_by=cu.id,
+        before={"status": PayrollStatus.LOCKED.value},
+        after={"status": PayrollStatus.OPEN.value},
+    )
+    db.commit()
+    db.refresh(period)
     return period
 
 
@@ -200,6 +505,19 @@ def _build_salary_map(assignments: list[SalaryAssignment]) -> dict[str, Decimal]
         comp_type = asgn.component.component_type.value
         result[comp_type] = result.get(comp_type, Decimal(0)) + asgn.amount
     return result
+
+
+def _salary_component_snapshot(assignments: list[SalaryAssignment]) -> list[dict]:
+    return [
+        {
+            "component_id": assignment.component_id,
+            "component_name": assignment.component.name,
+            "component_type": assignment.component.component_type.value,
+            "is_taxable": assignment.component.is_taxable,
+            "amount": float(assignment.amount),
+        }
+        for assignment in assignments
+    ]
 
 
 # Indonesian standard: 173 working hours per month (used for OT rate)
@@ -261,22 +579,17 @@ def calculate_period(
     if period.status == PayrollStatus.POSTED:
         raise HTTPException(400, "Period is already posted — cannot recalculate")
 
-    as_of = date(period.year, period.month, 1)
-    period_start = date(period.year, period.month, 1)
-    period_end   = date(period.year, period.month + 1, 1) if period.month < 12 else date(period.year + 1, 1, 1)
-
-    employees = (
-        db.query(Employee)
-        .filter(Employee.status.in_(["active", "probation"]))
-        .all()
-    )
+    period_start, as_of, period_end = _period_bounds(period)
+    employees = _eligible_employees(db, period)
 
     # ── Pre-load all salary assignments for this period in ONE query (N+1 fix) ──
     emp_ids = [e.id for e in employees]
     all_assignments = (
         db.query(SalaryAssignment)
         .options(joinedload(SalaryAssignment.component))
+        .join(SalaryComponent, SalaryAssignment.component_id == SalaryComponent.id)
         .filter(SalaryAssignment.employee_id.in_(emp_ids))
+        .filter(SalaryComponent.is_active == True)
         .filter(SalaryAssignment.effective_from <= as_of)
         .filter(
             (SalaryAssignment.effective_to == None) |  # noqa: E711
@@ -289,51 +602,127 @@ def calculate_period(
     for a in all_assignments:
         asgn_by_emp[a.employee_id].append(a)
 
+    salary_issues: list[str] = []
+    for employee in employees:
+        assignments = asgn_by_emp[employee.id]
+        basic_assignments = [
+            item for item in assignments
+            if item.component.component_type == SalaryComponentType.BASIC
+        ]
+        component_ids = [item.component_id for item in assignments]
+        if len(basic_assignments) != 1:
+            salary_issues.append(
+                f"{employee.employee_no}: requires exactly one active BASIC assignment"
+            )
+        elif any(item.amount <= 0 for item in assignments):
+            salary_issues.append(f"{employee.employee_no}: salary amount must be positive")
+        elif len(component_ids) != len(set(component_ids)):
+            salary_issues.append(f"{employee.employee_no}: overlapping salary assignments")
+    if salary_issues:
+        raise HTTPException(409, "Payroll cannot be calculated: " + "; ".join(salary_issues))
+
+    if include_thr:
+        duplicate_thr = (
+            db.query(Employee.employee_no)
+            .join(PayrollRun, PayrollRun.employee_id == Employee.id)
+            .join(PayrollPeriod, PayrollRun.period_id == PayrollPeriod.id)
+            .filter(
+                Employee.id.in_(emp_ids),
+                PayrollPeriod.year == period.year,
+                PayrollPeriod.id != period.id,
+                PayrollRun.thr_amount.isnot(None),
+                PayrollRun.thr_amount > 0,
+            )
+            .all()
+        )
+        if duplicate_thr:
+            employee_numbers = ", ".join(sorted({row[0] for row in duplicate_thr}))
+            raise HTTPException(409, f"THR already exists this year for: {employee_numbers}")
+
     # ── Pre-load attendance OT totals for this period in ONE query ──────────────
+    linked_legacy_overtime = _backfill_approved_overtime_attendance_links(
+        db, emp_ids, period_start, period_end,
+    )
+
+    # Pay actual attendance overtime, capped by the approved request hours.
     ot_rows = (
         db.query(
+            AttendanceRecord.id,
             AttendanceRecord.employee_id,
-            sql_func.sum(AttendanceRecord.hours_overtime_weekday).label("ot_wd"),
-            sql_func.sum(AttendanceRecord.hours_overtime_weekend).label("ot_we"),
-            sql_func.sum(AttendanceRecord.hours_overtime_holiday).label("ot_hol"),
+            AttendanceRecord.hours_overtime_weekday.label("ot_wd"),
+            AttendanceRecord.hours_overtime_weekend.label("ot_we"),
+            AttendanceRecord.hours_overtime_holiday.label("ot_hol"),
+            sql_func.max(OvertimeRequest.planned_hours).label("approved_hours"),
         )
+        .join(OvertimeRequest, and_(
+            OvertimeRequest.attendance_id == AttendanceRecord.id,
+            OvertimeRequest.employee_id == AttendanceRecord.employee_id,
+            OvertimeRequest.date == AttendanceRecord.date,
+        ))
         .filter(AttendanceRecord.employee_id.in_(emp_ids))
         .filter(AttendanceRecord.date >= period_start)
         .filter(AttendanceRecord.date <  period_end)
-        .group_by(AttendanceRecord.employee_id)
+        .filter(OvertimeRequest.status == OvertimeRequestStatus.APPROVED)
+        .group_by(
+            AttendanceRecord.id,
+            AttendanceRecord.employee_id,
+            AttendanceRecord.hours_overtime_weekday,
+            AttendanceRecord.hours_overtime_weekend,
+            AttendanceRecord.hours_overtime_holiday,
+        )
         .all()
     )
-    ot_by_emp: dict[int, tuple[Decimal, Decimal, Decimal]] = {
-        row.employee_id: (
-            Decimal(str(row.ot_wd  or 0)),
-            Decimal(str(row.ot_we  or 0)),
+    ot_totals: dict[int, list[Decimal]] = defaultdict(
+        lambda: [Decimal(0), Decimal(0), Decimal(0)]
+    )
+    for row in ot_rows:
+        paid_hours = _cap_overtime_hours(
+            Decimal(str(row.ot_wd or 0)),
+            Decimal(str(row.ot_we or 0)),
             Decimal(str(row.ot_hol or 0)),
+            Decimal(str(row.approved_hours or 0)),
         )
-        for row in ot_rows
+        for index, paid in enumerate(paid_hours):
+            ot_totals[row.employee_id][index] += paid
+    ot_by_emp: dict[int, tuple[Decimal, Decimal, Decimal]] = {
+        employee_id: (totals[0], totals[1], totals[2])
+        for employee_id, totals in ot_totals.items()
     }
 
+    eligible_ids = {employee.id for employee in employees}
+    stale_runs = (
+        db.query(PayrollRun)
+        .filter(PayrollRun.period_id == period.id)
+        .filter(~PayrollRun.employee_id.in_(eligible_ids) if eligible_ids else True)
+        .all()
+    )
+    if any(run.expense_id for run in stale_runs):
+        raise HTTPException(409, "Payroll contains posted runs for ineligible employees")
+    for stale_run in stale_runs:
+        db.delete(stale_run)
+
     runs: list[PayrollRun] = []
-    skipped_no_salary: list[str] = []
 
     for emp in employees:
-        salary_map = _build_salary_map(asgn_by_emp[emp.id])
-
-        if not salary_map:
-            skipped_no_salary.append(emp.employee_no)
-            logger.warning("No salary assignments for employee %s (%s) — skipping", emp.employee_no, emp.full_name)
-            continue
+        employee_assignments = asgn_by_emp[emp.id]
+        salary_map = _build_salary_map(employee_assignments)
 
         # Gross = BASIC + ALLOWANCE − DEDUCTION
         gross = Decimal(0)
-        snapshot: dict = {}
+        snapshot: dict = {"components": _salary_component_snapshot(employee_assignments)}
         for comp_type_val in [SalaryComponentType.BASIC.value, SalaryComponentType.ALLOWANCE.value]:
             amt = salary_map.get(comp_type_val, Decimal(0))
             gross += amt
             snapshot[comp_type_val] = float(amt)
         deductions = salary_map.get(SalaryComponentType.DEDUCTION.value, Decimal(0))
+        manual_bpjs = salary_map.get(SalaryComponentType.BPJS.value, Decimal(0))
+        manual_tax = salary_map.get(SalaryComponentType.TAX.value, Decimal(0))
         gross -= deductions
         snapshot["DEDUCTION"] = float(deductions)
-        gross = max(Decimal(0), gross)
+        snapshot["BPJS"] = float(manual_bpjs)
+        snapshot["TAX"] = float(manual_tax)
+        if gross < 0:
+            raise HTTPException(409, f"Salary deductions exceed earnings for {emp.employee_no}")
 
         # OT pay (Permenaker 2023) based on basic salary rate
         basic = salary_map.get(SalaryComponentType.BASIC.value, Decimal(0))
@@ -343,46 +732,72 @@ def calculate_period(
         snapshot["overtime_pay"] = float(ot_pay)
 
         # BPJS (calculated on gross including OT)
-        bpjs = calculate_bpjs(gross)
+        bpjs = _calculate_bpjs(gross)
         bpjs_tk_emp  = bpjs["jht_employee"] + bpjs["jp_employee"]
         bpjs_tk_er   = bpjs["jht_employer"] + bpjs["jp_employer"] + bpjs["jkk_employer"] + bpjs["jkm_employer"]
         bpjs_kes_emp = bpjs["kes_employee"]
         bpjs_kes_er  = bpjs["kes_employer"]
 
-        # PPh 21 — use employee's PTKP status and mid-year projection
-        ptkp_status = emp.ptkp_status or DEFAULT_PTKP
-        months_remaining = 12
-        if emp.join_date and emp.join_date.year == period.year:
-            months_remaining = max(1, 12 - emp.join_date.month + 1)
-
-        taxable = gross - bpjs_tk_emp - bpjs_kes_emp
-        if pph21_method == PPh21Method.NETTO:
-            pph21     = calculate_pph21_netto(taxable, ptkp_status, months_remaining)
-            tunjangan = Decimal(0)
-        else:
-            tunjangan, pph21 = calculate_pph21_gross_up(taxable, ptkp_status, months_remaining)
-
-        # THR (pro-rata or full basic)
+        # THR is taxable income and must be included before PPh 21 is calculated.
         thr = None
         if include_thr and emp.join_date:
-            months_worked = (as_of.year - emp.join_date.year) * 12 + (as_of.month - emp.join_date.month)
-            if months_worked >= 12:
-                thr = basic
-            elif months_worked > 0:
-                thr = (basic * months_worked / 12).quantize(Decimal("1"))
+            months_worked = max(
+                1,
+                (as_of.year - emp.join_date.year) * 12 + as_of.month - emp.join_date.month + 1,
+            )
+            thr = basic if months_worked >= 12 else (
+                basic * Decimal(months_worked) / Decimal(12)
+            ).quantize(Decimal("1"))
 
-        # Net pay
-        net = gross + tunjangan - bpjs_tk_emp - bpjs_kes_emp - pph21
-        net = max(Decimal(0), net)
+        taxable_earnings = sum(
+            assignment.amount
+            for assignment in employee_assignments
+            if assignment.component.is_taxable
+            and assignment.component.component_type in (
+                SalaryComponentType.BASIC,
+                SalaryComponentType.ALLOWANCE,
+            )
+        ) + ot_pay
+        taxable_gross = max(Decimal(0), taxable_earnings + (thr or Decimal(0)))
+        retirement_contribution = bpjs["jht_employee"] + bpjs["jp_employee"] + manual_bpjs
+        tunjangan, pph21, tax_metadata = _calculate_period_tax(
+            db,
+            emp,
+            period,
+            taxable_gross,
+            retirement_contribution,
+            pph21_method,
+        )
+
+        # THR is paid as a separate earning component on top of regular gross.
+        net = _calculate_net_pay(
+            gross,
+            tunjangan,
+            bpjs_tk_emp + bpjs_kes_emp + manual_bpjs,
+            pph21 + manual_tax,
+            thr,
+        )
 
         snapshot.update({
+            "bpjs": {key: float(value) for key, value in bpjs.items()},
             "bpjs_jht_employee": float(bpjs["jht_employee"]),
             "bpjs_jp_employee":  float(bpjs["jp_employee"]),
             "bpjs_kes_employee": float(bpjs_kes_emp),
+            "manual_bpjs_deduction": float(manual_bpjs),
+            "manual_tax_deduction": float(manual_tax),
+            "taxable_earnings": float(taxable_earnings),
+            "taxable_gross": float(taxable_gross + tunjangan),
+            "tax_retirement_contribution": float(retirement_contribution),
             "pph21":             float(pph21),
             "tunjangan_pajak":   float(tunjangan),
-            "ptkp_status":       ptkp_status,
-            "months_remaining":  months_remaining,
+            **tax_metadata,
+            "bpjs_parameters": {
+                "jp_salary_ceiling": float(settings.BPJS_JP_SALARY_CEILING),
+                "kes_salary_ceiling": float(settings.BPJS_KES_SALARY_CEILING),
+                "jkk_rate": float(settings.BPJS_JKK_RATE),
+            },
+            "thr_amount":        float(thr or 0),
+            "total_earnings":    float(gross + tunjangan + (thr or Decimal(0))),
         })
 
         # Upsert
@@ -403,14 +818,17 @@ def calculate_period(
         run.components_snapshot = snapshot
         runs.append(run)
 
-    write_audit(db, cu.id, "CALCULATE", "hris_payroll_periods", period.id, None,
-                {"employee_count": len(runs), "skipped_no_salary": skipped_no_salary})
+    write_audit(
+        db, "hris_payroll_periods", period.id, "CALCULATE",
+        changed_by=cu.id,
+        after={"employee_count": len(runs),
+               "linked_legacy_overtime": linked_legacy_overtime},
+    )
     db.commit()
     for r in runs:
         db.refresh(r)
 
-    logger.info("Payroll calculated: period=%s, employees=%s, skipped=%s",
-                period_id, len(runs), len(skipped_no_salary))
+    logger.info("Payroll calculated: period=%s, employees=%s", period_id, len(runs))
     return runs
 
 
@@ -442,8 +860,10 @@ def adjust_run(
     if not run:
         raise HTTPException(404, "Payroll run not found")
     period = db.get(PayrollPeriod, run.period_id)
-    if period and period.status == PayrollStatus.POSTED:
-        raise HTTPException(400, "Cannot adjust a posted period")
+    if not period:
+        raise HTTPException(404, "Payroll period not found")
+    if period.status != PayrollStatus.OPEN:
+        raise HTTPException(409, "Unlock the payroll period before making adjustments")
 
     before = {
         "gross_salary":   float(run.gross_salary),
@@ -452,25 +872,88 @@ def adjust_run(
         "cost_centre_id": run.cost_centre_id,
     }
 
-    if body.gross_salary   is not None: run.gross_salary   = body.gross_salary
-    if body.thr_amount     is not None: run.thr_amount     = body.thr_amount
-    if body.pph21_method   is not None: run.pph21_method   = body.pph21_method
-    if body.cost_centre_id is not None: run.cost_centre_id = body.cost_centre_id
+    payroll_fields_changed = bool(
+        {"gross_salary", "thr_amount", "pph21_method"} & body.model_fields_set
+    )
+    if body.gross_salary is not None:
+        run.gross_salary = body.gross_salary
+    if body.thr_amount is not None:
+        if body.thr_amount > 0:
+            duplicate_thr = (
+                db.query(PayrollRun)
+                .join(PayrollPeriod, PayrollRun.period_id == PayrollPeriod.id)
+                .filter(
+                    PayrollRun.employee_id == run.employee_id,
+                    PayrollRun.id != run.id,
+                    PayrollPeriod.year == period.year,
+                    PayrollRun.thr_amount.isnot(None),
+                    PayrollRun.thr_amount > 0,
+                )
+                .first()
+            )
+            if duplicate_thr:
+                raise HTTPException(409, "THR already exists for this employee in the same year")
+        run.thr_amount = body.thr_amount
+    if body.pph21_method is not None:
+        run.pph21_method = body.pph21_method
+    if "cost_centre_id" in body.model_fields_set:
+        run.cost_centre_id = body.cost_centre_id
 
-    # Recalculate net
-    bpjs     = calculate_bpjs(run.gross_salary)
-    bpjs_emp = bpjs["jht_employee"] + bpjs["jp_employee"] + bpjs["kes_employee"]
-    if run.pph21_method == PPh21Method.NETTO:
-        pph21     = calculate_pph21_netto(run.gross_salary - bpjs_emp)
-        tunjangan = Decimal(0)
-    else:
-        tunjangan, pph21 = calculate_pph21_gross_up(run.gross_salary - bpjs_emp)
-    run.pph21_amount = pph21
-    run.net_salary   = run.gross_salary + tunjangan - bpjs_emp - pph21
+    if payroll_fields_changed:
+        employee = db.get(Employee, run.employee_id)
+        if not employee:
+            raise HTTPException(404, "Employee not found")
+        bpjs = _calculate_bpjs(run.gross_salary)
+        bpjs_emp = bpjs["jht_employee"] + bpjs["jp_employee"] + bpjs["kes_employee"]
+        snapshot = dict(run.components_snapshot or {})
+        manual_bpjs = Decimal(str(snapshot.get("manual_bpjs_deduction", 0)))
+        manual_tax = Decimal(str(snapshot.get("manual_tax_deduction", 0)))
+        retirement_contribution = bpjs["jht_employee"] + bpjs["jp_employee"] + manual_bpjs
+        taxable_gross = run.gross_salary + (run.thr_amount or Decimal(0))
+        tunjangan, pph21, tax_metadata = _calculate_period_tax(
+            db,
+            employee,
+            period,
+            taxable_gross,
+            retirement_contribution,
+            run.pph21_method,
+        )
+        run.pph21_amount = pph21
+        run.net_salary = _calculate_net_pay(
+            run.gross_salary,
+            tunjangan,
+            bpjs_emp + manual_bpjs,
+            pph21 + manual_tax,
+            run.thr_amount,
+        )
+        run.bpjs_tk_employee = bpjs["jht_employee"] + bpjs["jp_employee"]
+        run.bpjs_tk_employer = (
+            bpjs["jht_employer"] + bpjs["jp_employer"]
+            + bpjs["jkk_employer"] + bpjs["jkm_employer"]
+        )
+        run.bpjs_kes_employee = bpjs["kes_employee"]
+        run.bpjs_kes_employer = bpjs["kes_employer"]
+        snapshot.update({
+            "bpjs": {key: float(value) for key, value in bpjs.items()},
+            "tunjangan_pajak": float(tunjangan),
+            "thr_amount": float(run.thr_amount or 0),
+            "taxable_gross": float(taxable_gross + tunjangan),
+            "tax_retirement_contribution": float(retirement_contribution),
+            "total_earnings": float(
+                run.gross_salary + tunjangan + (run.thr_amount or Decimal(0))
+            ),
+            **tax_metadata,
+        })
+        run.components_snapshot = snapshot
 
+    write_audit(
+        db, "hris_payroll_runs", run.id, "ADJUST",
+        changed_by=cu.id,
+        before=before,
+        after=body.model_dump(mode="json", exclude_none=True),
+    )
     db.commit()
     db.refresh(run)
-    write_audit(db, cu.id, "ADJUST", "hris_payroll_runs", run.id, before, body.model_dump(mode="json", exclude_none=True))
     return run
 
 
@@ -599,12 +1082,7 @@ def post_period(
             "Lock the period first after calculating payroll.",
         )
 
-    runs = db.query(PayrollRun).filter_by(period_id=period.id).all()
-    if not runs:
-        raise HTTPException(400, "No payroll runs found — run calculation first")
-
-    period.status    = PayrollStatus.POSTED
-    period.locked_by = cu.id   # reuse locked_by as poster (approved_by)
+    runs = _validate_period_complete(db, period)
 
     # ── Create ERP Expense records for each run that has a cost_centre_id ────
     from app.models import Expense, ExpenseStatus, ExpenseType, CostCode
@@ -618,36 +1096,48 @@ def post_period(
         .filter(CostCode.category == CostCodeCategory.PERSONNEL, CostCode.is_active == True)
         .first()
     )
+    if personnel_cc is None:
+        raise HTTPException(
+            409,
+            "Cannot post payroll: configure an active PERSONNEL cost code first",
+        )
     expenses_created = 0
     for run in runs:
-        if run.expense_id:
-            continue  # already posted
-        if personnel_cc is None:
-            continue  # no suitable cost code — skip silently
-        emp = db.get(Employee, run.employee_id)
-        exp = Expense(
-            expense_type=ExpenseType.REGULAR,
-            cost_code_id=personnel_cc.id,
-            cost_centre_id=run.cost_centre_id,
-            amount=run.net_salary,
-            description=f"Penggajian {period_label} — {emp.full_name if emp else run.employee_id}",
-            status=ExpenseStatus.APPROVED,
-            submitted_by=cu.id,
-            approved_by=cu.id,
-        )
-        db.add(exp)
-        db.flush()
-        run.expense_id = exp.id
-        expenses_created += 1
+        if not run.expense_id:
+            emp = db.get(Employee, run.employee_id)
+            exp = Expense(
+                expense_type=ExpenseType.REGULAR,
+                cost_code_id=personnel_cc.id,
+                cost_centre_id=run.cost_centre_id,
+                amount=run.net_salary,
+                description=f"Penggajian {period_label} — {emp.full_name if emp else run.employee_id}",
+                status=ExpenseStatus.APPROVED,
+                submitted_by=cu.id,
+                approved_by=cu.id,
+            )
+            db.add(exp)
+            db.flush()
+            run.expense_id = exp.id
+            expenses_created += 1
 
+        payslip = db.query(PaySlip).filter(PaySlip.run_id == run.id).first()
+        if payslip is None:
+            payslip = PaySlip(run_id=run.id)
+            db.add(payslip)
+        payslip.pdf_url = f"/api/hris/me/payslips/{run.id}/pdf"
+        payslip.generated_at = datetime.now(timezone.utc)
+
+    period.status = PayrollStatus.POSTED
+
+    write_audit(
+        db, "hris_payroll_periods", period.id, "POST",
+        changed_by=cu.id,
+        before={"status": "LOCKED"},
+        after={"status": "POSTED", "employee_count": len(runs), "expenses_created": expenses_created},
+    )
     db.commit()
     db.refresh(period)
 
-    write_audit(
-        db, cu.id, "POST", "hris_payroll_periods", period.id,
-        {"status": "LOCKED"},
-        {"status": "POSTED", "employee_count": len(runs), "expenses_created": expenses_created},
-    )
     logger.info(f"Payroll posted: period={period_id}, runs={len(runs)}, expenses_created={expenses_created}, by user={cu.id}")
     return period
 
@@ -666,6 +1156,7 @@ def export_bank_csv(
     Supports format: BCA (default), MANDIRI, BNI, BRI.
     Returns a CSV file download.
     """
+    _require(cu, _FINANCE_ROLES)
     period = db.get(PayrollPeriod, period_id)
     if not period:
         raise HTTPException(404, "Period not found")
@@ -679,6 +1170,17 @@ def export_bank_csv(
         .order_by(PayrollRun.employee_id)
         .all()
     )
+    missing_bank_data = [
+        run.employee.employee_no
+        for run in runs
+        if not run.employee or not run.employee.bank_name or not run.employee.bank_account
+    ]
+    if missing_bank_data:
+        raise HTTPException(
+            409,
+            "Bank export blocked; complete bank name/account for: "
+            + ", ".join(missing_bank_data),
+        )
 
     MONTHS_ID = [
         "", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
@@ -801,6 +1303,8 @@ def export_bpjs_report(
         emp = db.get(Employee, run.employee_id)
         snap = run.components_snapshot or {}
         bpjs = snap.get("bpjs", {})
+        if not bpjs:
+            bpjs = {key: float(value) for key, value in _calculate_bpjs(run.gross_salary).items()}
         ws_tk.append([
             idx,
             emp.employee_no if emp else "",
@@ -873,7 +1377,11 @@ def export_form_1721(
     runs_with_period = (
         db.query(PayrollRun, PayrollPeriod)
         .join(PayrollPeriod, PayrollRun.period_id == PayrollPeriod.id)
-        .filter(PayrollRun.employee_id == employee_id, PayrollPeriod.year == year)
+        .filter(
+            PayrollRun.employee_id == employee_id,
+            PayrollPeriod.year == year,
+            PayrollPeriod.status == PayrollStatus.POSTED,
+        )
         .order_by(PayrollPeriod.month)
         .all()
     )
@@ -914,8 +1422,11 @@ def export_form_1721(
     # Monthly breakdown header
     hdr_fill = PatternFill("solid", fgColor="1E3A5F")
     hdr_font = Font(color="FFFFFF", bold=True)
-    headers = ["Bulan", "Gaji Bruto", "BPJS TK Pegawai", "BPJS Kes Pegawai",
-               "PPh 21 Dipotong", "Gaji Neto", "Metode PPh"]
+    headers = [
+        "Bulan", "Gaji Bruto Reguler", "THR", "Tunjangan Pajak",
+        "Total Penghasilan Bruto", "BPJS TK Pegawai", "BPJS Kes Pegawai",
+        "PPh 21 Dipotong", "Gaji Neto", "Metode PPh",
+    ]
     ws.append(headers)
     for cell in ws[ws.max_row]:
         cell.font = hdr_font
@@ -929,23 +1440,30 @@ def export_form_1721(
     for m in range(1, 13):
         run = month_data.get(m)
         if run:
+            snapshot = run.components_snapshot or {}
+            tax_allowance = float(snapshot.get("tunjangan_pajak", 0) or 0)
+            thr_amount = float(run.thr_amount or 0)
+            gross_income = float(run.gross_salary) + thr_amount + tax_allowance
             ws.append([
                 MONTH_ID[m],
                 float(run.gross_salary),
+                thr_amount,
+                tax_allowance,
+                gross_income,
                 float(run.bpjs_tk_employee),
                 float(run.bpjs_kes_employee),
                 float(run.pph21_amount),
                 float(run.net_salary),
                 run.pph21_method.value,
             ])
-            total_gross += float(run.gross_salary)
+            total_gross += gross_income
             total_pph   += float(run.pph21_amount)
             total_net   += float(run.net_salary)
         else:
-            ws.append([MONTH_ID[m], 0, 0, 0, 0, 0, "—"])
+            ws.append([MONTH_ID[m], 0, 0, 0, 0, 0, 0, 0, 0, "-"])
 
     ws.append([])
-    ws.append(["TOTAL", total_gross, "", "", total_pph, total_net, ""])
+    ws.append(["TOTAL", "", "", "", total_gross, "", "", total_pph, total_net, ""])
     for cell in ws[ws.max_row]:
         cell.font = Font(bold=True)
 

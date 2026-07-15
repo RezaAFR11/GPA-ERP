@@ -14,7 +14,7 @@ from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, get_current_user, require_role
 from app.models import DocStatus, DocType, LegalDocument, RoleName, User
-from app.pdf_generator import MD_SIGNATURE_PATH, generate_document_pdf
+from app.pdf_generator import MD_SIGNATURE_PATH, generate_document_pdf, resolve_md_signature_path
 from app.schemas import (
     LegalDocCreate, LegalDocRejectRequest, LegalDocResponse, LegalDocUpdate,
     MessageResponse, PaginatedResponse,
@@ -47,10 +47,7 @@ def _next_doc_number(db: Session, doc_type: DocType) -> str:
 def md_signature_status(
     current_user: Annotated[User, Depends(require_role(RoleName.MD, RoleName.SUPER_ADMIN))],
 ):
-    return {
-        "exists": MD_SIGNATURE_PATH.exists(),
-        "path": str(MD_SIGNATURE_PATH),
-    }
+    return {"exists": resolve_md_signature_path().exists()}
 
 
 @router.post("/signature/md", summary="Upload MD signature asset")
@@ -66,8 +63,14 @@ async def upload_md_signature(
     if len(data) > 2_000_000:
         raise HTTPException(status_code=400, detail="Signature image must be under 2 MB")
 
-    MD_SIGNATURE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    MD_SIGNATURE_PATH.write_bytes(data)
+    try:
+        MD_SIGNATURE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MD_SIGNATURE_PATH.write_bytes(data)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Signature storage is unavailable. Check UPLOAD_DIR configuration.",
+        ) from exc
     return MessageResponse(message="MD signature uploaded")
 
 
