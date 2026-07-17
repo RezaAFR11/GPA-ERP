@@ -725,6 +725,52 @@ class InventoryTxn(Base):
     )
 
 
+# --- Cross-module operational records ---------------------------------------
+
+class OperationalRecord(Base, TimestampMixin):
+    """Shared workflow record for operational modules with common controls.
+
+    Module-specific attributes live in ``details`` while reference, ownership,
+    value, due date, progress, approval, and audit fields remain queryable.
+    """
+    __tablename__ = "operational_records"
+
+    id:               Mapped[int]           = mapped_column(Integer, primary_key=True)
+    module:           Mapped[str]           = mapped_column(String(50), nullable=False)
+    record_type:      Mapped[str]           = mapped_column(String(60), nullable=False)
+    reference_no:     Mapped[str]           = mapped_column(String(100), nullable=False)
+    title:            Mapped[str]           = mapped_column(String(500), nullable=False)
+    description:      Mapped[str|None]      = mapped_column(Text, nullable=True)
+    status:           Mapped[str]           = mapped_column(String(30), nullable=False, default="draft")
+    priority:         Mapped[str]           = mapped_column(String(20), nullable=False, default="normal")
+    project_id:       Mapped[int|None]      = mapped_column(ForeignKey("projects.id"), nullable=True)
+    partner_name:     Mapped[str|None]      = mapped_column(String(255), nullable=True)
+    amount:           Mapped[Decimal]       = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    currency:         Mapped[str]           = mapped_column(String(3), nullable=False, default="IDR")
+    progress:         Mapped[Decimal]       = mapped_column(Numeric(5, 2), nullable=False, default=Decimal("0"))
+    due_date:         Mapped[date|None]     = mapped_column(Date, nullable=True)
+    owner_id:         Mapped[int|None]      = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_by:       Mapped[int]           = mapped_column(ForeignKey("users.id"), nullable=False)
+    approved_by:      Mapped[int|None]      = mapped_column(ForeignKey("users.id"), nullable=True)
+    approved_at:      Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_at:        Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
+    details:          Mapped[dict]          = mapped_column(JSONB, nullable=False, default=dict)
+    workflow_history: Mapped[list]          = mapped_column(JSONB, nullable=False, default=list)
+
+    project:  Mapped["Project|None"] = relationship("Project", foreign_keys=[project_id])
+    owner:    Mapped["User|None"]    = relationship("User", foreign_keys=[owner_id])
+    creator:  Mapped["User"]         = relationship("User", foreign_keys=[created_by])
+    approver: Mapped["User|None"]    = relationship("User", foreign_keys=[approved_by])
+
+    __table_args__ = (
+        UniqueConstraint("module", "reference_no", name="uq_operational_record_reference"),
+        Index("ix_operational_records_module_status", "module", "status"),
+        Index("ix_operational_records_project", "project_id"),
+        Index("ix_operational_records_due_date", "due_date"),
+        Index("ix_operational_records_owner", "owner_id"),
+    )
+
+
 # ─── AuditLog ────────────────────────────────────────────────────────────────
 
 class AuditLog(Base):

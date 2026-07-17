@@ -12,14 +12,25 @@ from app.models import AppMenu, Role, RoleName, User, UserMenuPermission
 DEFAULT_MENUS = [
     ("dashboard", "Dashboard", "Workspace", "/dashboard", "Executive dashboard and KPI overview", 10),
     ("action_center", "Action Center", "Workspace", "/action-center", "Approval queue and pending actions", 15),
-    ("project_command", "Project Command", "Operations", "/projects", "Projects, contracts, POs, budget, archive controls", 20),
+    ("project_command", "Project Command", "Workspace", "/projects", "Project master, contract value, archive controls", 20),
     ("revenue_ar", "Revenue / AR", "Finance", "/revenue", "Client invoices, payments, outstanding AR", 30),
     ("spending", "Spending", "Finance", "/spending", "Expense drafts, approvals, payment workflow", 40),
     ("petty_cash", "Petty Cash", "Finance", "/spending", "Monthly petty cash reports and OCR/clipboard entry", 45),
-    ("inventory", "Inventory & Stock", "Operations", "/inventory", "Materials, tools, consumables, and stock movement", 50),
-    ("legal", "Legal & Proposals", "Procurement / Legal", "/legal", "Legal proposals, drafts, documents, signatures", 60),
-    ("procurement", "Procurement", "Procurement / Legal", "/procurement", "PO and contract tracking", 70),
-    ("reports", "Reports", "Reports", "/reports", "Finance, project, and operational reports", 80),
+    ("accounts_payable", "Accounts Payable", "Finance", "/accounts-payable", "Vendor invoices, payment vouchers, payable ageing", 46),
+    ("accounting_tax", "Accounting & Tax", "Finance", "/accounting-tax", "Journals, taxes, bank reconciliation, period controls", 47),
+    ("reports", "Reports", "Finance", "/reports", "Finance, project, and operational reports", 48),
+    ("budget_bi", "Budget & BI", "Finance", "/budget-bi", "Budgets, forecasts, cash flow, profitability, management KPI", 49),
+    ("project_execution", "Project Execution", "Project & EPC", "/project-execution", "WBS, progress, milestones, changes, claims, EAC", 50),
+    ("procurement", "Procurement", "Project & EPC", "/procurement", "Vendors, PR, RFQ, quotation, PO, goods receipt", 51),
+    ("engineering_documents", "Engineering Documents", "Project & EPC", "/engineering-documents", "Drawings, RFI, submittals, transmittals, as-built", 52),
+    ("quality_control", "QA / QC", "Project & EPC", "/quality-control", "ITP, inspection, test records, NCR, punch list", 53),
+    ("hse", "HSE", "Project & EPC", "/hse", "Incidents, permits, safety inspection, JSA/JHA, PPE", 54),
+    ("inventory", "Inventory & Stock", "Operations", "/inventory", "Materials, tools, consumables, and stock movement", 60),
+    ("warehouse_logistics", "Warehouse & Logistics", "Operations", "/warehouse-logistics", "Transfers, reservations, issues, returns, stock count", 61),
+    ("equipment_assets", "Equipment & Assets", "Operations", "/equipment-assets", "Asset register, maintenance, calibration, utilisation", 62),
+    ("legal", "Legal & Proposals", "Operations", "/legal", "Legal proposals, drafts, documents, signatures", 63),
+    ("contract_management", "Contract Management", "Operations", "/contracts", "Client, vendor, subcontract agreements and claims", 64),
+    ("crm_tender", "CRM & Tenders", "Operations", "/crm-tenders", "Customers, opportunities, tenders, estimates, quotations", 65),
     ("settings", "Settings", "Vault", "/settings", "Users, roles, branding, configuration", 90),
     ("vault", "Vault", "Vault", "/vault", "Approval matrix, cost codes, cost centres, audit log", 100),
     ("backend_admin", "Backend Admin", "System", "/admin", "Backend maintenance console", 110),
@@ -31,36 +42,47 @@ DEFAULT_MENUS = [
     ("hris_payroll",     "Penggajian",        "HRIS", "/hris/payroll",     "Payroll run, BPJS, PPh21, slip gaji",        240),
     ("hris_recruitment", "Rekrutmen",         "HRIS", "/hris/recruitment", "Job postings, applicant pipeline, onboarding", 250),
     ("hris_settings",    "Pengaturan HRIS",   "HRIS", "/hris/settings",    "Work locations, leave types, holiday calendar, salary components", 260),
+    ("manpower_operations", "Manpower Operations", "HRIS", "/hris/manpower", "Mobilisation, assignments, rosters, timesheets, competency", 265),
     # HRIS self-service — worker/employee portal
     ("hris_my_payslip",  "Slip Gaji Saya",    "Self Service", "/hris/me/payslip", "View own monthly payslips", 245),
 ]
-OBSOLETE_MENU_KEYS = {"expenses", "procurement"}
+OBSOLETE_MENU_KEYS = {"expenses"}
 
 ROLE_PRESETS: dict[str, set[str]] = {
     "SUPER_ADMIN": {key for key, *_ in DEFAULT_MENUS},
     "MD": {
         "dashboard", "action_center", "project_command", "revenue_ar", "spending",
-        "inventory", "legal", "reports",
+        "accounts_payable", "accounting_tax", "budget_bi", "project_execution",
+        "procurement", "engineering_documents", "quality_control", "hse",
+        "inventory", "warehouse_logistics", "equipment_assets", "legal",
+        "contract_management", "crm_tender", "reports", "manpower_operations",
         "hris_dashboard", "hris_employees", "hris_attendance", "hris_leave",
         "hris_payroll", "hris_recruitment", "hris_my_payslip",
     },
     "PM": {
         "dashboard", "action_center", "project_command", "spending",
-        "inventory", "legal", "reports",
+        "budget_bi", "project_execution", "procurement", "engineering_documents",
+        "quality_control", "hse", "inventory", "warehouse_logistics",
+        "equipment_assets", "legal", "contract_management", "crm_tender", "reports",
+        "manpower_operations",
         "hris_dashboard", "hris_employees", "hris_attendance", "hris_leave", "hris_my_payslip",
     },
     "COST_CONTROL": {
         "dashboard", "action_center", "project_command", "spending", "petty_cash",
-        "inventory", "reports",
+        "accounts_payable", "budget_bi", "project_execution", "procurement",
+        "inventory", "warehouse_logistics", "reports",
         "hris_dashboard", "hris_my_payslip",
     },
     "FINANCE": {
         "dashboard", "action_center", "project_command", "revenue_ar", "spending",
-        "petty_cash", "reports",
+        "petty_cash", "accounts_payable", "accounting_tax", "budget_bi",
+        "procurement", "equipment_assets", "reports",
         "hris_dashboard", "hris_payroll", "hris_my_payslip",
     },
     "GA": {
         "dashboard", "action_center", "spending", "petty_cash", "inventory",
+        "warehouse_logistics", "equipment_assets", "quality_control", "hse",
+        "contract_management", "manpower_operations",
         "hris_dashboard", "hris_employees", "hris_attendance", "hris_leave",
         "hris_recruitment", "hris_settings", "hris_my_payslip",
     },
@@ -173,6 +195,9 @@ def ensure_default_menus(db: Session) -> None:
                 "path": path,
                 "description": description,
                 "sort_order": sort_order,
+                # A previously obsolete menu must become available again when
+                # it returns to the supported default registry.
+                "is_active": key not in OBSOLETE_MENU_KEYS,
             }
             for field, value in updates.items():
                 if getattr(menu, field) != value:

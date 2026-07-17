@@ -690,6 +690,100 @@ class PaginatedResponse(BaseModel, Generic[T]):
     total: int
 
 
+# --- Reusable EPC operational workspace -------------------------------------
+
+class OperationalModuleResponse(BaseModel):
+    key: str
+    label: str
+    description: str
+    path: str
+    record_types: dict[str, str]
+    statuses: list[str]
+    can_approve: bool
+
+
+class OperationalRecordCreate(BaseModel):
+    record_type: str = Field(min_length=1, max_length=60)
+    reference_no: str | None = Field(None, max_length=100)
+    title: str = Field(min_length=2, max_length=500)
+    description: str | None = None
+    priority: str = Field(default="normal", pattern="^(low|normal|high|critical)$")
+    project_id: int | None = None
+    partner_name: str | None = Field(None, max_length=255)
+    amount: Decimal = Field(default=Decimal("0"), ge=Decimal("0"), decimal_places=2)
+    currency: str = Field(default="IDR", min_length=3, max_length=3)
+    progress: Decimal = Field(default=Decimal("0"), ge=Decimal("0"), le=Decimal("100"), decimal_places=2)
+    due_date: date | None = None
+    owner_id: int | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        return value.upper()
+
+
+class OperationalRecordUpdate(BaseModel):
+    record_type: str | None = Field(None, min_length=1, max_length=60)
+    reference_no: str | None = Field(None, min_length=1, max_length=100)
+    title: str | None = Field(None, min_length=2, max_length=500)
+    description: str | None = None
+    priority: str | None = Field(None, pattern="^(low|normal|high|critical)$")
+    project_id: int | None = None
+    partner_name: str | None = Field(None, max_length=255)
+    amount: Decimal | None = Field(None, ge=Decimal("0"), decimal_places=2)
+    currency: str | None = Field(None, min_length=3, max_length=3)
+    progress: Decimal | None = Field(None, ge=Decimal("0"), le=Decimal("100"), decimal_places=2)
+    due_date: date | None = None
+    owner_id: int | None = None
+    details: dict[str, Any] | None = None
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str | None) -> str | None:
+        return value.upper() if value else value
+
+
+class OperationalTransition(BaseModel):
+    action: str = Field(pattern="^(submit|review|approve|reject|activate|complete|close|cancel|reopen)$")
+    note: str | None = Field(None, max_length=1000)
+
+
+class OperationalRecordResponse(ORMBase):
+    id: int
+    module: str
+    record_type: str
+    reference_no: str
+    title: str
+    description: str | None
+    status: str
+    priority: str
+    project_id: int | None
+    partner_name: str | None
+    amount: Decimal
+    currency: str
+    progress: Decimal
+    due_date: date | None
+    owner_id: int | None
+    created_by: int
+    approved_by: int | None
+    approved_at: datetime | None
+    closed_at: datetime | None
+    details: dict[str, Any]
+    workflow_history: list[dict[str, Any]]
+    created_at: datetime
+    updated_at: datetime
+
+
+class OperationalSummary(BaseModel):
+    total: int
+    total_amount: Decimal
+    overdue: int
+    due_soon: int
+    average_progress: float
+    by_status: dict[str, int]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # HRIS Schemas — Phase H1: Data Karyawan & Organisasi
 # ═══════════════════════════════════════════════════════════════════════════════

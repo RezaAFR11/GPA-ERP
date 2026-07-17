@@ -5,6 +5,7 @@ Returns top-N results per entity group in a single call.
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -12,8 +13,9 @@ from app.dependencies import CurrentUser
 from app.menu_permissions import user_has_menu_access
 from app.models import (
     AccountReceivable, Expense, InventoryItem,
-    LegalDocument, Project, RoleName,
+    LegalDocument, OperationalRecord, Project, RoleName,
 )
+from app.operational_modules import MODULE_DEFINITIONS
 
 router = APIRouter(prefix="/search", tags=["Search"])
 
@@ -108,8 +110,41 @@ def global_search(
             .all()
         )
 
+    allowed_operational_modules = [
+        key for key in MODULE_DEFINITIONS
+        if user_has_menu_access(db, current_user, key)
+    ]
+    operational_records = []
+    if allowed_operational_modules:
+        operational_records = (
+            db.query(
+                OperationalRecord.id,
+                OperationalRecord.module,
+                OperationalRecord.reference_no,
+                OperationalRecord.title,
+                OperationalRecord.status,
+            )
+            .filter(
+                OperationalRecord.module.in_(allowed_operational_modules),
+                or_(
+                    OperationalRecord.reference_no.ilike(like),
+                    OperationalRecord.title.ilike(like),
+                    OperationalRecord.partner_name.ilike(like),
+                ),
+            )
+            .order_by(OperationalRecord.updated_at.desc())
+            .limit(limit)
+            .all()
+        )
+
     def _row(r):
         return dict(zip(r._fields, r))
+
+    operational_payload = []
+    for row in operational_records:
+        payload = _row(row)
+        payload["path"] = MODULE_DEFINITIONS[row.module].path
+        operational_payload.append(payload)
 
     return {
         "projects":    [_row(r) for r in projects],
@@ -117,4 +152,5 @@ def global_search(
         "receivables": [_row(r) for r in receivables],
         "legal_docs":  [_row(r) for r in legal_docs],
         "inventory":   [_row(r) for r in inventory],
+        "operational_records": operational_payload,
     }

@@ -19,7 +19,7 @@ from app.menu_permissions import (
     require_menu_access, user_has_menu_access,
 )
 from app.models import Base
-from app.routers import admin, auth, expenses, inventory, legal, notifications, petty_cash, projects, receivables, reports as reports_router, search, settings as settings_router, users, vault
+from app.routers import admin, auth, expenses, inventory, legal, notifications, operations, petty_cash, projects, receivables, reports as reports_router, search, settings as settings_router, users, vault
 from app.routers import hris_employees, hris_attendance, hris_payroll, hris_recruitment, hris_self_service
 
 settings = get_settings()
@@ -351,6 +351,7 @@ app.include_router(petty_cash.router,  prefix=API_PREFIX, dependencies=[Depends(
 app.include_router(vault.router,       prefix=API_PREFIX)
 app.include_router(legal.router,       prefix=API_PREFIX, dependencies=[Depends(require_menu_access("legal"))])
 app.include_router(inventory.router,   prefix=API_PREFIX, dependencies=[Depends(require_menu_access("inventory"))])
+app.include_router(operations.router,  prefix=API_PREFIX)
 app.include_router(search.router,         prefix=API_PREFIX)
 app.include_router(notifications.router,  prefix=API_PREFIX)
 app.include_router(reports_router.router, prefix=API_PREFIX)
