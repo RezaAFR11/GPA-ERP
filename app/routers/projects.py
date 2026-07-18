@@ -13,7 +13,7 @@ from typing import Annotated
 
 import pandas as pd
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
-from sqlalchemy import or_
+from sqlalchemy import case, or_
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -24,6 +24,7 @@ from app.models import (
     AccountReceivable, Expense, InventoryTxn, LegalDocument, PettyCashReport,
     Project, ProjectDocument, ProjectStatus, RoleName,
 )
+from app.query_sorting import apply_sorting
 from app.schemas import (
     MessageResponse, PaginatedResponse, ProjectCreate, ProjectDocumentResponse,
     ProjectImportResult, ProjectResponse, ProjectUpdate,
@@ -51,6 +52,8 @@ def list_projects(
     archived:     bool | None = None,
     include_archived: bool = False,
     search:       str | None = Query(None, description="Search project name or code"),
+    sort_by:      str | None = Query(None, description="Column used to order the result"),
+    sort_dir:     str | None = Query(None, pattern="^(asc|desc)$"),
     skip:         int = Query(0, ge=0),
     limit:        int = Query(100, ge=1, le=500),
 ):
@@ -67,7 +70,35 @@ def list_projects(
             Project.code.ilike(f"%{search}%"),
         ))
     total = q.count()
-    items = q.order_by(Project.code).offset(skip).limit(limit).all()
+    burn_rate = case(
+        (Project.contract_value > 0, Project.total_committed / Project.contract_value),
+        else_=0,
+    )
+    margin_rate = case(
+        (
+            Project.total_revenue > 0,
+            (Project.total_revenue - Project.total_committed) / Project.total_revenue,
+        ),
+        else_=0,
+    )
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        columns={
+            "code": Project.code,
+            "name": Project.name,
+            "status": Project.status,
+            "contract_value": Project.contract_value,
+            "burn_rate": burn_rate,
+            "margin": margin_rate,
+            "end_date": Project.end_date,
+        },
+        default_key="code",
+        default_dir="asc",
+        tie_breaker=Project.id,
+    )
+    items = q.offset(skip).limit(limit).all()
     return {"items": items, "total": total}
 
 

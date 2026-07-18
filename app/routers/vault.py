@@ -12,6 +12,7 @@ from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import SuperAdminUser, get_client_ip, require_role
 from app.models import AuditLog, ApprovalRule, CostCentre, CostCode, RoleName
+from app.query_sorting import apply_sorting
 from app.schemas import (
     ApprovalRuleCreate, ApprovalRuleResponse, ApprovalRuleUpdate,
     AuditLogResponse, CostCentreCreate, CostCentreResponse, CostCentreUpdate,
@@ -335,6 +336,8 @@ def global_audit_log(
     entity_type:   str | None = None,
     entity_id:     int | None = None,
     changed_by:    int | None = None,
+    sort_by:       str | None = Query(None, description="Column used to order the result"),
+    sort_dir:      str | None = Query(None, pattern="^(asc|desc)$"),
     skip:          int = Query(0, ge=0),
     limit:         int = Query(50, ge=1, le=500),
 ):
@@ -346,5 +349,20 @@ def global_audit_log(
     if changed_by:
         q = q.filter(AuditLog.changed_by == changed_by)
     total = q.count()
-    items = q.order_by(AuditLog.created_at.desc()).offset(skip).limit(limit).all()
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        columns={
+            "created_at": AuditLog.created_at,
+            "entity": AuditLog.entity_type,
+            "action": AuditLog.action,
+            "user": AuditLog.changed_by,
+            "ip_address": AuditLog.ip_address,
+        },
+        default_key="created_at",
+        default_dir="desc",
+        tie_breaker=AuditLog.id,
+    )
+    items = q.offset(skip).limit(limit).all()
     return {"items": items, "total": total}

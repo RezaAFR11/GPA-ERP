@@ -6,13 +6,14 @@ from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import get_client_ip, get_current_user, require_role
 from app.models import InventoryItem, InventoryTxn, Project, ProjectStatus, RoleName, TxnType, User
+from app.query_sorting import apply_sorting
 from app.schemas import (
     InventoryItemCreate, InventoryItemResponse, InventoryItemUpdate, InventorySummary,
     InventoryTxnCreate, InventoryTxnResponse, MessageResponse, PaginatedResponse,
@@ -61,6 +62,8 @@ def list_items(
     active_only: bool       = Query(True),
     is_active:   bool | None = Query(None),
     q:           str | None = Query(None),
+    sort_by:     str | None = Query(None, description="Column used to order the result"),
+    sort_dir:    str | None = Query(None, pattern="^(asc|desc)$"),
     skip:        int        = Query(0, ge=0),
     limit:       int        = Query(50, ge=1, le=200),
 ):
@@ -82,7 +85,28 @@ def list_items(
             InventoryItem.name.ilike(like) | InventoryItem.code.ilike(like)
         )
     total = query.count()
-    items = query.order_by(InventoryItem.category, InventoryItem.name).offset(skip).limit(limit).all()
+    stock_value = InventoryItem.qty_on_hand * func.coalesce(InventoryItem.unit_cost, 0)
+    stock_level = case(
+        (InventoryItem.min_stock > 0, InventoryItem.qty_on_hand / InventoryItem.min_stock),
+        else_=InventoryItem.qty_on_hand,
+    )
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        columns={
+            "item": InventoryItem.name,
+            "location": InventoryItem.location,
+            "qty_on_hand": InventoryItem.qty_on_hand,
+            "unit_cost": InventoryItem.unit_cost,
+            "stock_value": stock_value,
+            "stock_level": stock_level,
+        },
+        default_key="item",
+        default_dir="asc",
+        tie_breaker=InventoryItem.id,
+    )
+    items = query.offset(skip).limit(limit).all()
     return {"items": items, "total": total}
 
 

@@ -15,6 +15,7 @@ from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, require_role
 from app.models import ARStatus, AccountReceivable, Project, ProjectStatus, RoleName
+from app.query_sorting import apply_sorting
 from app.schemas import ARConfirm, ARCreate, ARResponse, ARSummary, ARUpdate, MessageResponse, PaginatedResponse
 
 router = APIRouter(prefix="/receivables", tags=["Revenue – Account Receivables"])
@@ -86,18 +87,42 @@ def list_receivables(
     ar_status:     ARStatus | None = None,
     search:        str | None     = Query(None, description="Search invoice number or customer name"),
     payment_state: str | None     = Query(None, description="Filter by payment state: paid | partial | open"),
+    sort_by:       str | None     = Query(None, description="Column used to order the result"),
+    sort_dir:      str | None     = Query(None, pattern="^(asc|desc)$"),
     skip:          int = Query(0, ge=0),
     limit:         int = Query(100, ge=1, le=500),
 ):
+    paid_expr = _paid_amount_expr()
+    remaining_expr = _remaining_amount_expr(paid_expr)
     q = _apply_receivable_filters(
-        db.query(AccountReceivable),
+        db.query(AccountReceivable).outerjoin(Project),
         project_id=project_id,
         ar_status=ar_status,
         search=search,
         payment_state=payment_state,
     )
     total = q.count()
-    items = q.order_by(AccountReceivable.id.desc()).offset(skip).limit(limit).all()
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        columns={
+            "id": AccountReceivable.id,
+            "invoice_no": AccountReceivable.invoice_no,
+            "project": Project.code,
+            "customer_name": AccountReceivable.customer_name,
+            "description": AccountReceivable.description,
+            "amount": AccountReceivable.amount,
+            "paid": paid_expr,
+            "outstanding": remaining_expr,
+            "due_date": AccountReceivable.due_date,
+            "status": AccountReceivable.status,
+        },
+        default_key="id",
+        default_dir="desc",
+        tie_breaker=AccountReceivable.id,
+    )
+    items = q.offset(skip).limit(limit).all()
     return {"items": items, "total": total}
 
 

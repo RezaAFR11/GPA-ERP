@@ -26,6 +26,7 @@ from app.operational_modules import (
     ModuleDefinition,
     next_status,
 )
+from app.query_sorting import apply_sorting
 from app.schemas import (
     AuditLogResponse,
     MessageResponse,
@@ -229,6 +230,8 @@ def list_records(
     record_type: str | None = None,
     record_status: str | None = Query(None, alias="status"),
     search: str | None = None,
+    sort_by: str | None = Query(None, description="Column used to order the result"),
+    sort_dir: str | None = Query(None, pattern="^(asc|desc)$"),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
 ):
@@ -240,7 +243,27 @@ def list_records(
         record_status=record_status, search=search,
     )
     total = query.count()
-    items = query.order_by(OperationalRecord.id.desc()).offset(skip).limit(limit).all()
+    query = query.outerjoin(Project, OperationalRecord.project_id == Project.id)
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        columns={
+            "id": OperationalRecord.id,
+            "reference_no": OperationalRecord.reference_no,
+            "record_type": OperationalRecord.record_type,
+            "title": OperationalRecord.title,
+            "project_partner": func.coalesce(Project.code, OperationalRecord.partner_name),
+            "amount": OperationalRecord.amount,
+            "progress": OperationalRecord.progress,
+            "due_date": OperationalRecord.due_date,
+            "status": OperationalRecord.status,
+        },
+        default_key="id",
+        default_dir="desc",
+        tie_breaker=OperationalRecord.id,
+    )
+    items = query.offset(skip).limit(limit).all()
     return {"items": items, "total": total}
 
 

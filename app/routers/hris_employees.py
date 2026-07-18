@@ -26,6 +26,7 @@ from app.models import (
     AttendanceRecord,
     JobPosting, PostingStatus,
 )
+from app.query_sorting import apply_sorting
 from app.schemas import (
     DepartmentCreate, DepartmentResponse, DepartmentUpdate, DepartmentNode,
     EmployeeCreate, EmployeeDocumentResponse, EmployeeResponse, EmployeeUpdate,
@@ -313,6 +314,8 @@ def list_employees(
     dept_id:     int | None  = None,
     tipe:        str | None  = None,
     status:      str | None  = "active",   # default: active employees only
+    sort_by:     str | None  = Query(None, description="Column used to order the result"),
+    sort_dir:    str | None  = Query(None, pattern="^(asc|desc)$"),
     skip:        int         = 0,
     limit:       int         = 50,
 ):
@@ -345,7 +348,27 @@ def list_employees(
             pass
 
     total = q.count()
-    items = q.order_by(Employee.full_name).offset(skip).limit(limit).all()
+    q = q.outerjoin(Department, Employee.dept_id == Department.id).outerjoin(
+        JobGrade, Employee.grade_id == JobGrade.id
+    )
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        columns={
+            "employee": Employee.full_name,
+            "department": Department.name,
+            "grade": JobGrade.level,
+            "employment_type": Employee.tipe,
+            "status": Employee.status,
+            "joined_at": Employee.join_date,
+            "account": Employee.user_id,
+        },
+        default_key="employee",
+        default_dir="asc",
+        tie_breaker=Employee.id,
+    )
+    items = q.offset(skip).limit(limit).all()
     return PaginatedResponse(
         items=[_employee_for_view(employee, current_user) for employee in items],
         total=total,
