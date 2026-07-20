@@ -7,7 +7,6 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import math
 import time
 import uuid
 from datetime import date, datetime, timezone, timedelta
@@ -27,6 +26,18 @@ from app.config import get_settings
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, require_role
 from app.hris_access import ensure_employee_can_use_self_service
+from app.hris_attendance_service import (
+    calculate_overtime as _calculate_overtime,
+    check_location as _check_location,
+    check_or_deduct_leave_balances as _check_or_deduct_leave_balances,
+    get_or_create_leave_balance as _get_or_create_leave_balance,
+    haversine as _haversine,
+    is_holiday as _is_holiday,
+    is_weekend as _is_weekend,
+    leave_days_by_year as _leave_days_by_year,
+    leave_duration as _leave_duration,
+    link_overtime_requests_to_attendance as _link_overtime_requests_to_attendance,
+)
 from app.hris_time import (
     MAX_BROWSER_TIMEZONE_OFFSET,
     MIN_BROWSER_TIMEZONE_OFFSET,
@@ -35,9 +46,9 @@ from app.hris_time import (
 )
 from app.models import (
     AttendanceRecord, AttendanceSource,
-    Employee, LeaveBalance, LeaveCategory, LeaveRequest, LeaveRequestStatus, LeaveType,
+    Employee, LeaveBalance, LeaveRequest, LeaveRequestStatus, LeaveType,
     RoleName, WorkGroup, WorkLocation, WorkLocationType, effective_roles,
-    OvertimeRequest, OvertimeRequestStatus, HolidayCalendar,
+    OvertimeRequest, OvertimeRequestStatus,
 )
 from app.menu_permissions import require_menu_access
 from app.notify import push, push_to_role
@@ -89,158 +100,6 @@ def _cleanup_orphan_leave_certificates(db: Session, user_id: int) -> int:
     return removed
 
 
-# ─── Overtime calculation (Permenaker No. 2 Tahun 2023) ─────────────────────
-
-def _calculate_overtime(
-    clock_in:  datetime,
-    clock_out: datetime,
-    is_weekend: bool,
-    is_holiday: bool,
-) -> tuple[Decimal, Decimal, Decimal, Decimal]:
-    """
-    Returns (hours_regular, hours_ot_weekday, hours_ot_weekend, hours_ot_holiday).
-    Permenaker 2023 rules:
-      Weekday: first 8h regular, OT starts after 8h
-      Weekend/Holiday: all hours are OT
-    """
-    MAX_DAILY_HOURS = Decimal("24")  # sanity cap — forgot to clock out guard
-    total_hours = max(Decimal(0), min(
-        Decimal(str((clock_out - clock_in).total_seconds() / 3600)),
-        MAX_DAILY_HOURS,
-    ))
-    REGULAR_HOURS = Decimal("8")
-
-    if is_holiday:
-        return Decimal("0"), Decimal("0"), Decimal("0"), total_hours
-    if is_weekend:
-        return Decimal("0"), Decimal("0"), total_hours, Decimal("0")
-
-    # Weekday
-    regular = min(total_hours, REGULAR_HOURS)
-    ot      = max(Decimal("0"), total_hours - REGULAR_HOURS)
-    return regular, ot, Decimal("0"), Decimal("0")
-
-
-def _is_weekend(d: date) -> bool:
-    return d.weekday() >= 5  # Saturday=5, Sunday=6
-
-
-def _is_holiday(db: Session, attendance_date: date) -> bool:
-    return db.query(HolidayCalendar.id).filter(HolidayCalendar.date == attendance_date).first() is not None
-
-
-def _leave_duration(db: Session, start_date: date, end_date: date) -> tuple[int, list[dict]]:
-    """Count Monday-Friday leave days, excluding configured holidays."""
-    if end_date < start_date:
-        raise HTTPException(422, "end_date must be greater than or equal to start_date")
-
-    holidays = (
-        db.query(HolidayCalendar)
-        .filter(HolidayCalendar.date >= start_date, HolidayCalendar.date <= end_date)
-        .all()
-    )
-    holiday_by_date = {holiday.date: holiday for holiday in holidays}
-    excluded_holidays: list[dict] = []
-    working_days = 0
-
-    for offset in range((end_date - start_date).days + 1):
-        current_date = start_date + timedelta(days=offset)
-        if _is_weekend(current_date):
-            continue
-        holiday = holiday_by_date.get(current_date)
-        if holiday:
-            excluded_holidays.append({
-                "date": holiday.date.isoformat(),
-                "name": holiday.name,
-            })
-            continue
-        working_days += 1
-
-    return working_days, excluded_holidays
-
-
-def _leave_days_by_year(db: Session, start_date: date, end_date: date) -> dict[int, int]:
-    allocations: dict[int, int] = {}
-    for year in range(start_date.year, end_date.year + 1):
-        segment_start = max(start_date, date(year, 1, 1))
-        segment_end = min(end_date, date(year, 12, 31))
-        days, _ = _leave_duration(db, segment_start, segment_end)
-        if days:
-            allocations[year] = days
-    return allocations
-
-
-def _get_or_create_leave_balance(
-    db: Session,
-    employee_id: int,
-    leave_type: LeaveType,
-    year: int,
-    lock: bool = False,
-) -> LeaveBalance:
-    query = db.query(LeaveBalance).filter(
-        LeaveBalance.employee_id == employee_id,
-        LeaveBalance.leave_type_id == leave_type.id,
-        LeaveBalance.year == year,
-    )
-    if lock:
-        query = query.with_for_update()
-    balance = query.first()
-    if balance is None:
-        balance = LeaveBalance(
-            employee_id=employee_id,
-            leave_type_id=leave_type.id,
-            year=year,
-            accrued=leave_type.max_days_per_year or 0,
-            used=0,
-        )
-        db.add(balance)
-        db.flush()
-    return balance
-
-
-def _check_or_deduct_leave_balances(
-    db: Session,
-    employee_id: int,
-    leave_type: LeaveType,
-    allocations: dict[int, int],
-    deduct: bool = False,
-) -> None:
-    if leave_type.category in (LeaveCategory.MATERNITY, LeaveCategory.PATERNITY):
-        return
-    if leave_type.max_days_per_year is None:
-        return
-
-    balances: list[tuple[LeaveBalance, int]] = []
-    for year, days in allocations.items():
-        balance = _get_or_create_leave_balance(
-            db, employee_id, leave_type, year, lock=deduct,
-        )
-        if balance.remaining < days:
-            raise HTTPException(
-                422,
-                f"Insufficient {leave_type.name} balance for {year}: "
-                f"{balance.remaining} days remaining, {days} required",
-            )
-        balances.append((balance, days))
-    if deduct:
-        for balance, days in balances:
-            balance.used += days
-
-
-def _link_overtime_requests_to_attendance(db: Session, record: AttendanceRecord) -> list[int]:
-    """Attach overtime requests for the same employee/date to an attendance record."""
-    requests = (
-        db.query(OvertimeRequest)
-        .filter(
-            OvertimeRequest.employee_id == record.employee_id,
-            OvertimeRequest.date == record.date,
-            OvertimeRequest.attendance_id.is_(None),
-        )
-        .all()
-    )
-    for overtime_request in requests:
-        overtime_request.attendance_id = record.id
-    return [overtime_request.id for overtime_request in requests]
 
 
 def _require_current_leave_approver(request: LeaveRequest, current_user) -> None:
@@ -271,56 +130,6 @@ def _visible_employee_ids(db: Session, current_user) -> list[int] | None:
     return [own.id]
 
 
-# ─── Geolocation helpers ──────────────────────────────────────────────────────
-
-def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Return great-circle distance in metres between two GPS points."""
-    R = 6_371_000  # Earth radius in metres
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi       = math.radians(lat2 - lat1)
-    dlambda    = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-def _check_location(
-    db: Session,
-    latitude: float,
-    longitude: float,
-    assigned_location: "WorkLocation | None" = None,
-) -> tuple[bool, "WorkLocation | None", float]:
-    """
-    Check GPS coords against WorkLocations.
-
-    If the employee has an assigned work_location, validate ONLY against that
-    location — so a Jakarta employee can't clock-in at a Berau site and vice versa.
-
-    If no location is assigned, fall back to checking all active locations
-    (previous behaviour — matches the nearest one within any radius).
-
-    The caller decides whether a failed geofence check should block clock-in.
-    """
-    if assigned_location is not None:
-        # Validate strictly against the employee's assigned location only
-        locations = [assigned_location]
-    else:
-        locations = db.query(WorkLocation).filter(WorkLocation.is_active == True).all()
-
-    best: WorkLocation | None = None
-    best_dist = float("inf")
-    for loc in locations:
-        dist = _haversine(latitude, longitude, float(loc.latitude), float(loc.longitude))
-        if dist <= loc.radius_meters and dist < best_dist:
-            best, best_dist = loc, dist
-    # If no match found, compute distance to nearest for reporting
-    if best is None:
-        nearest_dist = float("inf")
-        for loc in locations:
-            dist = _haversine(latitude, longitude, float(loc.latitude), float(loc.longitude))
-            if dist < nearest_dist:
-                nearest_dist = dist
-        return False, None, nearest_dist if nearest_dist != float("inf") else 0.0
-    return True, best, best_dist
 
 
 # ─── Attendance: clock-in (mobile, geolocation + selfie) ─────────────────────

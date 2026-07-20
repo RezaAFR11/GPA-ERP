@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import case, func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.audit import model_to_dict, write_audit
 from app.database import get_db
@@ -254,6 +254,8 @@ def list_transactions(
     _get_item_or_404(item_id, db)
     return (
         db.query(InventoryTxn)
+        # InventoryTxnResponse exposes creator.role for every transaction.
+        .options(joinedload(InventoryTxn.creator).joinedload(User.role))
         .filter(InventoryTxn.item_id == item_id)
         .order_by(InventoryTxn.created_at.desc())
         .limit(limit)

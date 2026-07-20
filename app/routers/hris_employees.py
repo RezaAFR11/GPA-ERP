@@ -2,10 +2,7 @@
 GPA-ERP HRIS — Phase H1: Data Karyawan & Organisasi
 Endpoints for employees, departments, and job grades.
 """
-import secrets
-import string
-from calendar import monthrange
-from datetime import date, datetime, timezone, timedelta
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
@@ -18,12 +15,18 @@ from app.audit import model_to_dict, write_audit
 from app.config import get_settings
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, hash_password, require_role
-from app.menu_permissions import ROLE_PRESETS, require_menu_access
+from app.hris_employee_service import (
+    build_hris_dashboard_stats,
+    employee_for_view as _employee_for_view,
+    generate_password as _generate_password,
+    next_employee_number as _next_employee_no,
+    seed_user_menus as _seed_user_menus,
+)
+from app.menu_permissions import require_menu_access
 from app.models import (
-    AppMenu, Department, EmpDocType, Employee, EmployeeDocument, EmployeeStatus, EmploymentType,
-    JobGrade, LeaveBalance, LeaveType, Role, RoleName, User, UserMenuPermission, WorkGroup,
+    Department, EmpDocType, Employee, EmployeeDocument, EmployeeStatus, EmploymentType,
+    JobGrade, Role, RoleName, User, WorkGroup,
     HolidayCalendar, EmployeeDataChangeRequest, DataChangeStatus,
-    AttendanceRecord,
     JobPosting, PostingStatus,
 )
 from app.query_sorting import apply_sorting
@@ -36,39 +39,10 @@ from app.schemas import (
     WorkGroupCreate, WorkGroupResponse, WorkGroupUpdate,
     HolidayCalendarCreate, HolidayCalendarResponse,
     CHANGEABLE_FIELDS, DataChangeRequestCreate, DataChangeRequestResponse, DataChangeActionRequest,
-    HrisDashboardStats, HeadcountTrendItem, DeptAttendanceItem, PkwtAlertItem,
+    HrisDashboardStats,
 )
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-
-def _generate_password(length: int = 12) -> str:
-    """Generate a random password: at least one uppercase, one digit, one symbol."""
-    alphabet = string.ascii_letters + string.digits + "!@#$"
-    while True:
-        pw = "".join(secrets.choice(alphabet) for _ in range(length))
-        if (any(c.isupper() for c in pw)
-                and any(c.isdigit() for c in pw)
-                and any(c in "!@#$" for c in pw)):
-            return pw
-
-
-def _next_employee_no(db: Session) -> str:
-    """Generate a unique auto employee number like EMP0007."""
-    n = db.query(Employee).count() + 1
-    while db.query(Employee).filter(Employee.employee_no == f"EMP{n:04d}").first():
-        n += 1
-    return f"EMP{n:04d}"
-
-
-def _seed_user_menus(db: Session, user: User) -> None:
-    """Seed menu permissions for a newly created user from their role preset."""
-    menus = {m.key: m for m in db.query(AppMenu).filter(AppMenu.is_active == True).all()}
-    preset_keys = ROLE_PRESETS.get(user.role.name.value, ROLE_PRESETS["STAFF"])
-    for key in preset_keys:
-        menu = menus.get(key)
-        if menu:
-            db.add(UserMenuPermission(user_id=user.id, menu_id=menu.id, can_access=True))
 
 router = APIRouter(prefix="/hris", tags=["HRIS – Employees"])
 
@@ -84,21 +58,6 @@ _account_link_roles = (
 _account_admin_roles = (RoleName.SUPER_ADMIN, RoleName.MD)
 _ga_assignable       = (RoleName.WORKER, RoleName.STAFF)
 
-_employee_sensitive_fields = (
-    "nik", "npwp", "email", "phone", "bank_name", "bank_account",
-    "bpjs_tk_no", "bpjs_kes_no",
-)
-
-
-def _employee_for_view(employee: Employee, current_user: User) -> dict:
-    """Redact private HR/payroll data from directory-only viewers."""
-    data = EmployeeResponse.model_validate(employee).model_dump()
-    if current_user.role.name not in _hr_roles:
-        for field in _employee_sensitive_fields:
-            data[field] = None
-        data["documents"] = []
-        data["user"] = None
-    return data
 
 _UPLOAD_ROOT = Path(get_settings().UPLOAD_DIR)
 _UPLOADS_DIR = _UPLOAD_ROOT / "employee_docs"
@@ -837,190 +796,15 @@ def assign_work_group(
 def hris_dashboard_stats(
     cu: CurrentUser,
     db: Annotated[Session, Depends(get_db)],
-    year:  int = Query(default=None),
+    year: int = Query(default=None),
     month: int = Query(default=None),
 ):
     today = date.today()
-    year  = year  or today.year
-    month = month or today.month
-
-    # ── Headcount KPIs ───────────────────────────────────────────────────────
-    all_emps = db.query(Employee).all()
-    total_employees = len(all_emps)
-    active    = sum(1 for e in all_emps if e.status == EmployeeStatus.ACTIVE)
-    probation = sum(1 for e in all_emps if e.status == EmployeeStatus.PROBATION)
-    current_emps = [
-        e for e in all_emps
-        if e.status in (EmployeeStatus.ACTIVE, EmployeeStatus.PROBATION)
-    ]
-    employment_type_counts = {
-        employment_type.value: sum(1 for e in current_emps if e.tipe == employment_type)
-        for employment_type in EmploymentType
-    }
-
-    year_start = date(year, 1, 1)
-    report_year_end = min(date(year, 12, 31), today)
-    terminated_ytd = sum(
-        1 for e in all_emps
-        if e.status == EmployeeStatus.TERMINATED
-        and e.end_date
-        and year_start <= e.end_date <= report_year_end
-    )
-    hired_ytd = sum(
-        1 for e in all_emps
-        if e.join_date and year_start <= e.join_date <= report_year_end
-    )
-
-    # ── Headcount trend (last 6 months) ──────────────────────────────────────
-    trend: list[HeadcountTrendItem] = []
-    for i in range(5, -1, -1):
-        # Last day of each of the past 6 months
-        mn = (today.month - i - 1) % 12 + 1
-        yr = today.year - ((today.month - i - 1) // 12 + 1 if today.month - i <= 0 else 0)
-        if today.month - i <= 0:
-            yr = today.year - 1
-            mn = today.month - i + 12
-        else:
-            yr = today.year
-            mn = today.month - i
-        snap_date = date(yr, mn, monthrange(yr, mn)[1])
-        # Employment dates, rather than today's status, define historical headcount.
-        count = sum(
-            1 for e in all_emps
-            if (e.join_date is None or e.join_date <= snap_date)
-            and (e.end_date is None or e.end_date >= snap_date)
-        )
-        # Simpler: just count current active + probation for current month
-        if mn == today.month and yr == today.year:
-            count = active + probation
-        trend.append(HeadcountTrendItem(month=f"{yr}-{mn:02d}", count=count))
-
-    # ── PKWT expiry alerts ────────────────────────────────────────────────────
-    pkwt_emps = [
-        e for e in all_emps
-        if e.tipe == EmploymentType.PKWT
-        and e.end_date
-        and e.status in (EmployeeStatus.ACTIVE, EmployeeStatus.PROBATION)
-    ]
-    def days_left(e: Employee) -> int:
-        return (e.end_date - today).days if e.end_date else 9999
-
-    expiring_30  = [e for e in pkwt_emps if 0 <= days_left(e) <= 30]
-    expiring_60  = [e for e in pkwt_emps if 0 <= days_left(e) <= 60]
-    expiring_90  = [e for e in pkwt_emps if 0 <= days_left(e) <= 90]
-
-    pkwt_list = sorted(
-        [e for e in pkwt_emps if 0 <= days_left(e) <= 90],
-        key=lambda e: e.end_date,
-    )[:10]
-
-    alert_items = [
-        PkwtAlertItem(
-            id=e.id,
-            employee_no=e.employee_no,
-            full_name=e.full_name,
-            dept=e.department.name if e.department else None,
-            end_date=e.end_date,
-            days_left=days_left(e),
-        )
-        for e in pkwt_list
-    ]
-
-    # ── Leave liability (accrued - used, current year) ───────────────────────
-    balances = db.query(LeaveBalance).filter(
-        LeaveBalance.year == year,
-    ).join(LeaveType).filter(LeaveType.is_paid == True).all()
-    leave_liability_days = sum(max(0, b.accrued - b.used) for b in balances)
-
-    # ── Attendance rate for the selected month ────────────────────────────────
-    month_start = date(year, month, 1)
-    month_last = date(year, month, monthrange(year, month)[1])
-    report_end = min(month_last, today)
-    holidays = {
-        row[0] for row in db.query(HolidayCalendar.date).filter(
-            HolidayCalendar.date >= month_start,
-            HolidayCalendar.date <= report_end,
-        ).all()
-    } if report_end >= month_start else set()
-    working_dates = [
-        month_start + timedelta(days=offset)
-        for offset in range((report_end - month_start).days + 1)
-        if (month_start + timedelta(days=offset)).weekday() < 5
-        and (month_start + timedelta(days=offset)) not in holidays
-    ] if report_end >= month_start else []
-
-    att_rows = (
-        db.query(AttendanceRecord.date, sql_func.count(AttendanceRecord.id))
-        .join(Employee, Employee.id == AttendanceRecord.employee_id)
-        .filter(
-            AttendanceRecord.date.in_(working_dates),
-            AttendanceRecord.clock_in.isnot(None),
-            or_(Employee.join_date.is_(None), Employee.join_date <= AttendanceRecord.date),
-            or_(Employee.end_date.is_(None), Employee.end_date >= AttendanceRecord.date),
-        )
-        .group_by(AttendanceRecord.date)
-        .all()
-    )
-
-    def employed_on(employee: Employee, work_date: date) -> bool:
-        return (
-            (employee.join_date is None or employee.join_date <= work_date)
-            and (employee.end_date is None or employee.end_date >= work_date)
-        )
-
-    expected_total = sum(
-        1 for work_date in working_dates for employee in all_emps
-        if employed_on(employee, work_date)
-    )
-    actual_present = sum(cnt for _, cnt in att_rows)
-    attendance_rate_pct = round(actual_present / expected_total * 100, 1) if expected_total > 0 else 0.0
-
-    # ── Attendance rate by dept ───────────────────────────────────────────────
-    dept_att_rows = (
-        db.query(Employee.dept_id, sql_func.count(AttendanceRecord.id))
-        .join(AttendanceRecord, AttendanceRecord.employee_id == Employee.id)
-        .filter(
-            AttendanceRecord.date.in_(working_dates),
-            AttendanceRecord.clock_in.isnot(None),
-            or_(Employee.join_date.is_(None), Employee.join_date <= AttendanceRecord.date),
-            or_(Employee.end_date.is_(None), Employee.end_date >= AttendanceRecord.date),
-        )
-        .group_by(Employee.dept_id)
-        .all()
-    )
-    dept_expected: dict[int, int] = {}
-    for work_date in working_dates:
-        for employee in all_emps:
-            if employee.dept_id is not None and employed_on(employee, work_date):
-                dept_expected[employee.dept_id] = dept_expected.get(employee.dept_id, 0) + 1
-
-    dept_map = {d.id: d.name for d in db.query(Department).all()}
-    dept_attendance: list[DeptAttendanceItem] = []
-    dept_present = {dept_id: count for dept_id, count in dept_att_rows if dept_id is not None}
-    for dept_id, expected in dept_expected.items():
-        present_count = dept_present.get(dept_id, 0)
-        rate = round(present_count / expected * 100, 1) if expected > 0 else 0.0
-        dept_attendance.append(DeptAttendanceItem(
-            dept=dept_map.get(dept_id, "Unknown"),
-            rate_pct=rate,
-        ))
-    dept_attendance.sort(key=lambda x: x.rate_pct)
-
-    return HrisDashboardStats(
-        total_employees=total_employees,
-        active=active,
-        probation=probation,
-        terminated_ytd=terminated_ytd,
-        hired_ytd=hired_ytd,
-        employment_type_counts=employment_type_counts,
-        headcount_trend=trend,
-        pkwt_expiring_30d=len(expiring_30),
-        pkwt_expiring_60d=len(expiring_60),
-        pkwt_expiring_90d=len(expiring_90),
-        pkwt_expiring_list=alert_items,
-        leave_liability_days=leave_liability_days,
-        attendance_rate_pct=attendance_rate_pct,
-        dept_attendance=dept_attendance,
+    return build_hris_dashboard_stats(
+        db,
+        year=year or today.year,
+        month=month or today.month,
+        today=today,
     )
 
 

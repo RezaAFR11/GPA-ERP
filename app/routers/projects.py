@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, require_role
+from app.finance_queries import project_list_payload
 from app.models import (
     AccountReceivable, Expense, InventoryTxn, LegalDocument, PettyCashReport,
     Project, ProjectDocument, ProjectStatus, RoleName,
@@ -98,7 +99,22 @@ def list_projects(
         default_dir="asc",
         tie_breaker=Project.id,
     )
-    items = q.offset(skip).limit(limit).all()
+    # Select hybrid totals with each project so response serialization does not
+    # lazily load every expense and receivable collection (the N+1 pattern).
+    rows = (
+        q.with_entities(
+            Project,
+            Project.total_revenue.label("total_revenue"),
+            Project.total_committed.label("total_committed"),
+        )
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+    items = [
+        project_list_payload(project, total_revenue, total_committed)
+        for project, total_revenue, total_committed in rows
+    ]
     return {"items": items, "total": total}
 
 

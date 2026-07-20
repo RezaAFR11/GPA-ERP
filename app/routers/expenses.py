@@ -16,8 +16,7 @@ stored on the Expense so it is immutable thereafter.
 from __future__ import annotations
 
 import io
-from datetime import date, datetime, timezone
-from decimal import Decimal
+from datetime import date, datetime
 from typing import Annotated
 
 import uuid
@@ -39,11 +38,24 @@ from app.audit import model_to_dict, write_audit
 from app.config import get_settings
 from app.database import get_db
 from app.dependencies import (
-    CurrentUser, get_client_ip, get_required_approvers_from_matrix, require_role,
+    CurrentUser, get_client_ip, require_role,
+)
+from app.expense_workflow import (
+    advance_approval_chain,
+    append_history_event,
+    build_submission_chain,
+    role_can_act,
+    role_can_reject,
+    start_approval,
+)
+from app.finance_queries import (
+    expense_action_queue_clause,
+    expense_response_options,
+    expense_stats_columns,
+    expense_stats_payload,
 )
 from app.models import (
     CostCentre, CostCode, Expense, ExpenseStatus, ExpenseType, Project, ProjectStatus, RoleName,
-    effective_roles,
 )
 from app.notify import push, push_to_role
 from app.schemas import (
@@ -63,18 +75,6 @@ def _get_or_404(expense_id: int, db: Session) -> Expense:
     if not e:
         raise HTTPException(status_code=404, detail="Expense not found")
     return e
-
-
-def _add_history_event(expense: Expense, actor_id: int, action: str, note: str | None = None):
-    history = list(expense.approval_history or [])
-    history.append({
-        "action":    action,
-        "role":      expense.current_approver_role,
-        "user_id":   actor_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "note":      note,
-    })
-    expense.approval_history = history
 
 
 # ─── List / Get ──────────────────────────────────────────────────────────────
@@ -116,7 +116,15 @@ def list_expenses(
             Expense.reference_no.ilike(f"%{search}%"),
         ))
     total = q.count()
-    items = q.order_by(Expense.id.desc()).offset(skip).limit(limit).all()
+    # ExpenseResponse includes cost-code and submitter details. Eager loading
+    # keeps the query count constant as the page size grows.
+    items = (
+        q.options(*expense_response_options())
+        .order_by(Expense.id.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
     return {"items": items, "total": total}
 
 
@@ -128,36 +136,30 @@ def get_expense_stats(
     date_from:    str | None = Query(None),
     date_to:      str | None = Query(None),
 ):
-    logged_statuses  = {ExpenseStatus.SUBMITTED, ExpenseStatus.VERIFIED, ExpenseStatus.APPROVED, ExpenseStatus.PAID, ExpenseStatus.HARD_LOCKED}
-    approved_statuses = {ExpenseStatus.APPROVED, ExpenseStatus.PAID, ExpenseStatus.HARD_LOCKED}
-    paid_statuses     = {ExpenseStatus.PAID, ExpenseStatus.HARD_LOCKED}
-
     base = db.query(Expense)
     if current_user.role.name in {RoleName.STAFF, RoleName.WORKER}:
         base = base.filter(Expense.submitted_by == current_user.id)
     if project_id:
         base = base.filter(Expense.project_id == project_id)
 
-    def _sum(statuses: set) -> Decimal:
-        result = base.filter(Expense.status.in_(statuses)).with_entities(func.coalesce(func.sum(Expense.amount), 0)).scalar()
-        return Decimal(str(result))
+    # Conditional aggregation replaces ten round trips with one while keeping
+    # every total and status bucket in the existing response.
+    row = base.with_entities(*expense_stats_columns()).one()
+    return ExpenseStats(**expense_stats_payload(row))
 
-    def _count(st: ExpenseStatus) -> int:
-        return base.filter(Expense.status == st).count()
 
-    return ExpenseStats(
-        total_logged   = _sum(logged_statuses),
-        total_approved = _sum(approved_statuses),
-        total_paid     = _sum(paid_statuses),
-        count_by_status = {
-            "draft":       _count(ExpenseStatus.DRAFT),
-            "submitted":   _count(ExpenseStatus.SUBMITTED),
-            "verified":    _count(ExpenseStatus.VERIFIED),
-            "approved":    _count(ExpenseStatus.APPROVED),
-            "paid":        _count(ExpenseStatus.PAID),
-            "hard_locked": _count(ExpenseStatus.HARD_LOCKED),
-            "rejected":    _count(ExpenseStatus.REJECTED),
-        },
+@router.get("/action-queue", response_model=list[ExpenseResponse], summary="Actionable expenses for the current user")
+def list_action_queue_expenses(
+    current_user: CurrentUser,
+    db:           Annotated[Session, Depends(get_db)],
+):
+    """Return only expenses that can produce an Action Center command."""
+    return (
+        db.query(Expense)
+        .filter(expense_action_queue_clause(current_user.role.name, current_user.id))
+        .options(*expense_response_options())
+        .order_by(Expense.id.desc())
+        .all()
     )
 
 
@@ -444,26 +446,9 @@ def submit_expense(
         raise HTTPException(status_code=409,
                             detail=f"Cannot submit from status '{expense.status}'")
 
-    # Build approval chain
-    if expense.expense_type == ExpenseType.REIMBURSEMENT:
-        # Fixed reimbursement chain: GA receipt check → CC verify → Finance approve+pay
-        chain = [RoleName.GA.value, RoleName.COST_CONTROL.value, RoleName.FINANCE.value]
-    else:
-        # Regular expense: chain from approval matrix, CC always first
-        cost_code = db.query(CostCode).filter(CostCode.id == expense.cost_code_id).first()
-        chain = get_required_approvers_from_matrix(db, expense.amount, cost_code.category)
-        if RoleName.COST_CONTROL.value not in chain:
-            chain.insert(0, RoleName.COST_CONTROL.value)
-
     before = model_to_dict(expense)
-    expense.status               = ExpenseStatus.SUBMITTED
-    expense.submitted_by         = current_user.id
-    expense.approval_chain       = chain
-    expense.approval_step        = 0
-    expense.current_approver_role= chain[0] if chain else None
-    expense.rejection_reason     = None
-
-    _add_history_event(expense, current_user.id, "SUBMIT", payload.note)
+    chain = build_submission_chain(db, expense)
+    start_approval(expense, current_user.id, chain, payload.note)
 
     write_audit(db, "Expense", expense.id, "SUBMIT",
                 changed_by=current_user.id, ip_address=get_client_ip(request),
@@ -504,11 +489,10 @@ def verify_expense(
         raise HTTPException(status_code=409,
                             detail="Expense must be in 'submitted' status to verify")
 
-    expected_role  = expense.current_approver_role
-    caller_values  = {r.value for r in effective_roles(current_user.role.name)}
+    expected_role = expense.current_approver_role
 
     # Only the expected role (or SUPER_ADMIN) may act. HR acts as GA via aliasing.
-    if expected_role not in caller_values and current_user.role.name != RoleName.SUPER_ADMIN:
+    if not role_can_act(current_user.role.name, expected_role):
         raise HTTPException(
             status_code=403,
             detail=f"This expense is waiting for {expected_role} to verify",
@@ -530,8 +514,8 @@ def verify_expense(
         action_label = "VERIFY"
         notif_msg    = f"Pengeluaran #{expense.id} telah diverifikasi oleh Cost Control"
 
-    _add_history_event(expense, current_user.id, action_label, payload.note)
-    _advance_chain(expense)
+    append_history_event(expense, current_user.id, action_label, payload.note)
+    advance_approval_chain(expense)
 
     write_audit(db, "Expense", expense.id, action_label,
                 changed_by=current_user.id, ip_address=get_client_ip(request),
@@ -575,8 +559,7 @@ def approve_expense(
                             detail="Expense must be submitted or verified to approve")
 
     expected_role = expense.current_approver_role
-    caller_values = {r.value for r in effective_roles(current_user.role.name)}
-    if expected_role not in caller_values and current_user.role.name != RoleName.SUPER_ADMIN:
+    if not role_can_act(current_user.role.name, expected_role):
         raise HTTPException(
             status_code=403,
             detail=f"Current approval step requires role: {expected_role}",
@@ -584,9 +567,9 @@ def approve_expense(
 
     before = model_to_dict(expense)
     expense.approved_by = current_user.id
-    _add_history_event(expense, current_user.id, "APPROVE", payload.note)
+    append_history_event(expense, current_user.id, "APPROVE", payload.note)
 
-    _advance_chain(expense)
+    advance_approval_chain(expense)
 
     # Budget check only applies when expense is linked to a project
     over_budget      = None
@@ -637,7 +620,7 @@ def pay_expense(
     expense.status  = ExpenseStatus.PAID
     expense.paid_by = current_user.id
     expense.current_approver_role = None
-    _add_history_event(expense, current_user.id, "PAY", payload.note)
+    append_history_event(expense, current_user.id, "PAY", payload.note)
 
     write_audit(db, "Expense", expense.id, "PAY",
                 changed_by=current_user.id, ip_address=get_client_ip(request),
@@ -672,7 +655,7 @@ def lock_expense(
 
     before = model_to_dict(expense)
     expense.status = ExpenseStatus.HARD_LOCKED
-    _add_history_event(expense, current_user.id, "HARD_LOCK")
+    append_history_event(expense, current_user.id, "HARD_LOCK")
 
     write_audit(db, "Expense", expense.id, "HARD_LOCK",
                 changed_by=current_user.id, ip_address=get_client_ip(request),
@@ -700,18 +683,15 @@ def reject_expense(
         raise HTTPException(status_code=409,
                             detail=f"Cannot reject an expense with status '{expense.status}'")
 
-    # Must be an approver in the chain or SUPER_ADMIN / FINANCE
-    allowed_rejectors = set(expense.approval_chain or []) | {
-        RoleName.SUPER_ADMIN.value, RoleName.FINANCE.value
-    }
-    if not any(role.value in allowed_rejectors for role in effective_roles(current_user.role.name)):
+    # Must be an approver in the chain or SUPER_ADMIN / FINANCE.
+    if not role_can_reject(current_user.role.name, expense.approval_chain):
         raise HTTPException(status_code=403, detail="You are not in the approval chain")
 
     before = model_to_dict(expense)
     expense.status                = ExpenseStatus.REJECTED
     expense.rejection_reason      = payload.reason
     expense.current_approver_role = None
-    _add_history_event(expense, current_user.id, "REJECT", payload.reason)
+    append_history_event(expense, current_user.id, "REJECT", payload.reason)
 
     write_audit(db, "Expense", expense.id, "REJECT",
                 changed_by=current_user.id, ip_address=get_client_ip(request),
@@ -788,26 +768,3 @@ def expense_audit_trail(
         }
         for l in logs
     ]
-
-
-# ─── Internal helper ─────────────────────────────────────────────────────────
-
-def _advance_chain(expense: Expense):
-    """
-    Move to the next step in the approval chain.
-    If all steps are exhausted → APPROVED; otherwise stay VERIFIED and
-    point current_approver_role at the next role.
-    """
-    chain = expense.approval_chain or []
-    expense.approval_step += 1
-
-    if expense.approval_step >= len(chain):
-        # All approvers done
-        expense.status                = ExpenseStatus.APPROVED
-        expense.current_approver_role = None
-    else:
-        next_role = chain[expense.approval_step]
-        # COST_CONTROL step already advances to VERIFIED
-        if chain[expense.approval_step - 1] == RoleName.COST_CONTROL.value:
-            expense.status = ExpenseStatus.VERIFIED
-        expense.current_approver_role = next_role

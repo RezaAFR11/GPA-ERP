@@ -9,7 +9,7 @@ import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.audit import model_to_dict, write_audit
 from app.database import get_db
@@ -35,10 +35,27 @@ router = APIRouter(
 
 
 def _get_or_404(report_id: int, db: Session) -> PettyCashReport:
-    report = db.query(PettyCashReport).filter(PettyCashReport.id == report_id).first()
+    report = (
+        db.query(PettyCashReport)
+        .options(*_report_response_options())
+        .filter(PettyCashReport.id == report_id)
+        .first()
+    )
     if not report:
         raise HTTPException(status_code=404, detail="Petty cash report not found")
     return report
+
+
+def _report_response_options():
+    """Load all nested PettyCashReportResponse fields without per-row queries."""
+    return (
+        joinedload(PettyCashReport.project).selectinload(Project.receivables),
+        joinedload(PettyCashReport.project).selectinload(Project.expenses),
+        joinedload(PettyCashReport.cost_code),
+        joinedload(PettyCashReport.cost_centre),
+        joinedload(PettyCashReport.creator).joinedload(User.role),
+        selectinload(PettyCashReport.lines).joinedload(PettyCashReportLine.expense),
+    )
 
 
 def _validate_master_data(
@@ -100,7 +117,7 @@ def list_reports(
     skip: int = 0,
     limit: int = 100,
 ):
-    q = db.query(PettyCashReport)
+    q = db.query(PettyCashReport).options(*_report_response_options())
     if project_id:
         q = q.filter(PettyCashReport.project_id == project_id)
     if month:

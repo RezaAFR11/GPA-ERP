@@ -8,12 +8,12 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, get_current_user, require_role
-from app.models import DocStatus, DocType, LegalDocument, RoleName, User
+from app.models import DocStatus, DocType, LegalDocument, Project, RoleName, User
 from app.pdf_generator import MD_SIGNATURE_PATH, generate_document_pdf, resolve_md_signature_path
 from app.schemas import (
     LegalDocCreate, LegalDocRejectRequest, LegalDocResponse, LegalDocUpdate,
@@ -31,6 +31,16 @@ _TYPE_CODES = {
 
 _SIGN_ROLES = (RoleName.MD, RoleName.PM, RoleName.PROJECT_CONTROL, RoleName.SUPER_ADMIN)
 _SIGNATURE_TYPES = {"image/png", "image/jpeg", "image/jpg"}
+
+
+def _legal_response_options():
+    """Load the relationships exposed by LegalDocResponse in fixed queries."""
+    return (
+        joinedload(LegalDocument.creator).joinedload(User.role),
+        joinedload(LegalDocument.signer).joinedload(User.role),
+        joinedload(LegalDocument.project).selectinload(Project.receivables),
+        joinedload(LegalDocument.project).selectinload(Project.expenses),
+    )
 
 
 def _next_doc_number(db: Session, doc_type: DocType) -> str:
@@ -86,7 +96,7 @@ def list_documents(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
 ):
-    q = db.query(LegalDocument)
+    q = db.query(LegalDocument).options(*_legal_response_options())
     if doc_type:
         q = q.filter(LegalDocument.doc_type == doc_type)
     if status:
@@ -145,7 +155,12 @@ def get_document(
     current_user: Annotated[User, Depends(get_current_user)],
     db:           Annotated[Session, Depends(get_db)],
 ):
-    doc = db.query(LegalDocument).filter(LegalDocument.id == doc_id).first()
+    doc = (
+        db.query(LegalDocument)
+        .options(*_legal_response_options())
+        .filter(LegalDocument.id == doc_id)
+        .first()
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     return doc

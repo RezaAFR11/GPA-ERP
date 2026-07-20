@@ -9,12 +9,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import case, func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, require_role
-from app.models import ARStatus, AccountReceivable, Project, ProjectStatus, RoleName
+from app.models import ARStatus, AccountReceivable, Project, ProjectStatus, RoleName, User
 from app.query_sorting import apply_sorting
 from app.schemas import ARConfirm, ARCreate, ARResponse, ARSummary, ARUpdate, MessageResponse, PaginatedResponse
 
@@ -95,7 +95,10 @@ def list_receivables(
     paid_expr = _paid_amount_expr()
     remaining_expr = _remaining_amount_expr(paid_expr)
     q = _apply_receivable_filters(
-        db.query(AccountReceivable).outerjoin(Project),
+        db.query(AccountReceivable)
+        .outerjoin(Project)
+        # ARResponse includes the confirmer and role; load both with the page.
+        .options(joinedload(AccountReceivable.confirmer).joinedload(User.role)),
         project_id=project_id,
         ar_status=ar_status,
         search=search,
