@@ -108,6 +108,17 @@ def project_list_payload(
     }
 
 
+def project_lookup_payload(project: Project) -> dict[str, Any]:
+    """Return selector fields without evaluating project financial hybrids."""
+    return {
+        "id": project.id,
+        "code": project.code,
+        "name": project.name,
+        "is_archived": project.is_archived,
+        "status": project.status,
+    }
+
+
 def expense_action_queue_clause(role: RoleName, user_id: int):
     """Return the exact records that can produce an Action Center command.
 

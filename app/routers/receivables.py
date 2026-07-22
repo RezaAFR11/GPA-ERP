@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import case, func, or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.audit import model_to_dict, write_audit
@@ -32,10 +32,7 @@ def _get_or_404(ar_id: int, db: Session) -> AccountReceivable:
 
 
 def _paid_amount_expr():
-    return case(
-        (AccountReceivable.actual_payment.isnot(None), AccountReceivable.actual_payment),
-        else_=Decimal("0"),
-    )
+    return func.coalesce(AccountReceivable.actual_payment, Decimal("0"))
 
 
 def _remaining_amount_expr(paid_expr):
@@ -71,11 +68,20 @@ def _apply_receivable_filters(
     paid_expr = _paid_amount_expr()
     remaining_expr = _remaining_amount_expr(paid_expr)
     if payment_state == "paid":
-        q = q.filter(paid_expr > 0, remaining_expr <= Decimal("1"))
+        q = q.filter(
+            AccountReceivable.actual_payment > 0,
+            remaining_expr <= Decimal("1"),
+        )
     elif payment_state == "partial":
-        q = q.filter(paid_expr > 0, remaining_expr > Decimal("1"))
+        q = q.filter(
+            AccountReceivable.actual_payment > 0,
+            remaining_expr > Decimal("1"),
+        )
     elif payment_state == "open":
-        q = q.filter(paid_expr <= 0)
+        q = q.filter(or_(
+            AccountReceivable.actual_payment.is_(None),
+            AccountReceivable.actual_payment <= 0,
+        ))
     return q
 
 
@@ -94,17 +100,22 @@ def list_receivables(
 ):
     paid_expr = _paid_amount_expr()
     remaining_expr = _remaining_amount_expr(paid_expr)
-    q = _apply_receivable_filters(
-        db.query(AccountReceivable)
-        .outerjoin(Project)
-        # ARResponse includes the confirmer and role; load both with the page.
-        .options(joinedload(AccountReceivable.confirmer).joinedload(User.role)),
+    filtered_q = _apply_receivable_filters(
+        db.query(AccountReceivable),
         project_id=project_id,
         ar_status=ar_status,
         search=search,
         payment_state=payment_state,
     )
-    total = q.count()
+    # Count the filtered AR table directly; the project/confirmer joins are only
+    # needed by the requested page and made the former count query needlessly heavy.
+    total = filtered_q.with_entities(func.count(AccountReceivable.id)).scalar() or 0
+    q = (
+        filtered_q
+        .outerjoin(Project)
+        # ARResponse includes the confirmer and role; load both with the page.
+        .options(joinedload(AccountReceivable.confirmer).joinedload(User.role))
+    )
     q = apply_sorting(
         q,
         sort_by=sort_by,

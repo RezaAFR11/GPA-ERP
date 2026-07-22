@@ -344,6 +344,7 @@ class Project(Base, TimestampMixin):
     __table_args__ = (
         UniqueConstraint("code", name="projects_code_key"),
         Index("ix_projects_code", "code"),
+        Index("ix_projects_archived_code", "is_archived", "code"),
     )
 
     def __repr__(self) -> str:
@@ -472,6 +473,23 @@ class AccountReceivable(Base, TimestampMixin):
 
     __table_args__ = (
         Index("ix_ar_project_status", "project_id", "status"),
+        Index("ix_ar_status", "status"),
+        Index("ix_ar_actual_payment", "actual_payment"),
+        Index("ix_ar_amount", "amount"),
+        Index("ix_ar_due_date", "due_date"),
+        Index("ix_ar_customer_name", "customer_name"),
+        Index(
+            "ix_ar_invoice_no_trgm",
+            "invoice_no",
+            postgresql_using="gin",
+            postgresql_ops={"invoice_no": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_ar_customer_name_trgm",
+            "customer_name",
+            postgresql_using="gin",
+            postgresql_ops={"customer_name": "gin_trgm_ops"},
+        ),
     )
 
     def __repr__(self) -> str:

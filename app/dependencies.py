@@ -59,7 +59,7 @@ def create_access_token(data: dict) -> tuple[str, int]:
 
 # ─── Current user ────────────────────────────────────────────────────────────
 
-async def get_current_user(
+def get_current_user(
     request:     Request,
     db:          Annotated[Session, Depends(get_db)],
     bearer:      Annotated[HTTPAuthorizationCredentials | None, Depends(_http_bearer)] = None,

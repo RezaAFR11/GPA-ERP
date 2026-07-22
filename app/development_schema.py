@@ -237,6 +237,9 @@ def _ensure_incremental_schema():
 
 def prepare_development_database() -> None:
     """Prepare legacy local data without changing production startup behavior."""
+    # Revenue contains-search indexes use PostgreSQL's standard trigram operator class.
+    with engine.begin() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
     Base.metadata.create_all(bind=engine)
     _ensure_incremental_schema()
 

@@ -175,6 +175,16 @@ class ProjectUpdate(BaseModel):
     status:         ProjectStatus   | None = None
 
 
+class ProjectLookupResponse(ORMBase):
+    """Small project shape used by selectors and list labels."""
+
+    id:          int
+    code:        str
+    name:        str
+    is_archived: bool
+    status:      ProjectStatus
+
+
 class ProjectResponse(ORMBase):
     id:             int
     code:           str

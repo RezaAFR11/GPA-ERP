@@ -1,4 +1,3 @@
-import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -96,7 +95,7 @@ def test_token_version_invalidates_existing_session() -> None:
     credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
 
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(get_current_user(make_request("/api/users/me"), auth_db_for(user), credentials))
+        get_current_user(make_request("/api/users/me"), auth_db_for(user), credentials)
 
     assert exc.value.status_code == 401
 
@@ -107,11 +106,11 @@ def test_must_change_password_is_enforced_by_backend() -> None:
     credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
 
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(get_current_user(make_request("/api/projects"), auth_db_for(user), credentials))
+        get_current_user(make_request("/api/projects"), auth_db_for(user), credentials)
     assert exc.value.status_code == 403
 
-    resolved = asyncio.run(
-        get_current_user(make_request("/api/users/me/password"), auth_db_for(user), credentials)
+    resolved = get_current_user(
+        make_request("/api/users/me/password"), auth_db_for(user), credentials
     )
     assert resolved.id == user.id
 

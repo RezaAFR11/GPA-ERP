@@ -8,6 +8,7 @@ from app.finance_queries import (
     PAID_EXPENSE_STATUSES,
     expense_stats_payload,
     project_list_payload,
+    project_lookup_payload,
 )
 from app.models import ExpenseStatus, ProjectStatus
 
@@ -84,3 +85,21 @@ def test_project_list_payload_keeps_values_and_revenue_driven_budget():
     assert payload["total_committed"] == Decimal("125.00")
     assert payload["budget"] == Decimal("175.00")
     assert payload["created_at"] is created_at
+
+
+def test_project_lookup_payload_excludes_financial_hybrids():
+    project = SimpleNamespace(
+        id=8,
+        code="UAT-008",
+        name="Lookup Project",
+        is_archived=False,
+        status=ProjectStatus.ACTIVE,
+    )
+
+    assert project_lookup_payload(project) == {
+        "id": 8,
+        "code": "UAT-008",
+        "name": "Lookup Project",
+        "is_archived": False,
+        "status": ProjectStatus.ACTIVE,
+    }

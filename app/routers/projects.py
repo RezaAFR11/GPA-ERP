@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from app.audit import model_to_dict, write_audit
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, require_role
-from app.finance_queries import project_list_payload
+from app.finance_queries import project_list_payload, project_lookup_payload
 from app.models import (
     AccountReceivable, Expense, InventoryTxn, LegalDocument, PettyCashReport,
     Project, ProjectDocument, ProjectStatus, RoleName,
@@ -28,7 +28,7 @@ from app.models import (
 from app.query_sorting import apply_sorting
 from app.schemas import (
     MessageResponse, PaginatedResponse, ProjectCreate, ProjectDocumentResponse,
-    ProjectImportResult, ProjectResponse, ProjectUpdate,
+    ProjectImportResult, ProjectLookupResponse, ProjectResponse, ProjectUpdate,
 )
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
@@ -116,6 +116,25 @@ def list_projects(
         for project, total_revenue, total_committed in rows
     ]
     return {"items": items, "total": total}
+
+
+@router.get(
+    "/lookup",
+    response_model=list[ProjectLookupResponse],
+    summary="Lightweight project options",
+)
+def list_project_lookup(
+    current_user: CurrentUser,
+    db:           Annotated[Session, Depends(get_db)],
+    include_archived: bool = False,
+    limit:        int = Query(500, ge=1, le=500),
+):
+    """Load selector fields without project-wide revenue/expense aggregates."""
+    q = db.query(Project)
+    if not include_archived:
+        q = q.filter(Project.is_archived == False)  # noqa: E712
+    projects = q.order_by(Project.code.asc(), Project.id.asc()).limit(limit).all()
+    return [project_lookup_payload(project) for project in projects]
 
 
 @router.post("", response_model=ProjectResponse, status_code=201,
