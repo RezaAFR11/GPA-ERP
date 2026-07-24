@@ -6,8 +6,8 @@ from pydantic import ValidationError
 
 from app.menu_permissions import DEFAULT_MENUS, OBSOLETE_MENU_KEYS
 from app.operational_modules import MODULE_DEFINITIONS, STATUS_TRANSITIONS, next_status
-from app.routers.operations import _validate_domain_fields
-from app.schemas import OperationalRecordCreate, OperationalTransition
+from app.routers.operations import _validate_client_po, _validate_domain_fields
+from app.schemas import ClientPODataInput, OperationalRecordCreate, OperationalTransition
 
 
 EXPECTED_MODULES = {
@@ -87,3 +87,77 @@ def test_journal_totals_must_balance_when_provided():
         )
     assert "balance" in str(error.value.detail).lower()
 
+
+def _valid_client_po() -> ClientPODataInput:
+    return ClientPODataInput(
+        line_items=[{
+            "sequence": 1,
+            "item_no": "001",
+            "description": "Gas detector",
+            "quantity": "2",
+            "uom": "EA",
+            "unit_price": "500",
+            "line_total": "1000",
+        }],
+        payment_terms=[
+            {
+                "sequence": 1,
+                "percentage": "40",
+                "trigger": "Down payment",
+                "dpp_amount": "400",
+                "tax_amount": "44",
+                "gross_amount": "444",
+            },
+            {
+                "sequence": 2,
+                "percentage": "60",
+                "trigger": "Delivery",
+                "dpp_amount": "600",
+                "tax_amount": "66",
+                "gross_amount": "666",
+            },
+        ],
+    )
+
+
+def test_client_po_is_registered_and_commercial_totals_are_validated():
+    assert "client_purchase_order" in MODULE_DEFINITIONS["contract_management"].record_types
+    _validate_client_po(
+        module="contract_management",
+        record_type="client_purchase_order",
+        project_id=1,
+        partner_name="PT Client",
+        amount=Decimal("1000"),
+        details={"tax_amount": "110", "grand_total": "1110"},
+        client_po=_valid_client_po(),
+    )
+
+
+def test_client_po_rejects_boq_total_that_differs_from_dpp():
+    client_po = _valid_client_po()
+    client_po.line_items[0].line_total = Decimal("900")
+    with pytest.raises(HTTPException) as error:
+        _validate_client_po(
+            module="contract_management",
+            record_type="client_purchase_order",
+            project_id=1,
+            partner_name="PT Client",
+            amount=Decimal("1000"),
+            details={"tax_amount": "110", "grand_total": "1110"},
+            client_po=client_po,
+        )
+    assert "quantity times unit price" in str(error.value.detail)
+
+
+def test_client_po_submission_requires_delivery_boq_and_payment_schedule():
+    with pytest.raises(HTTPException) as error:
+        _validate_client_po(
+            module="contract_management",
+            record_type="client_purchase_order",
+            project_id=1,
+            partner_name="PT Client",
+            amount=Decimal("1000"),
+            details={"tax_amount": "110", "grand_total": "1110", "po_date": "2026-07-24"},
+            require_complete=True,
+        )
+    assert "delivery term" in str(error.value.detail)

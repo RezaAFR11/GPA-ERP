@@ -172,6 +172,7 @@ MODULE_DEFINITIONS: dict[str, ModuleDefinition] = {
         prefix="CTR",
         record_types={
             "client_contract": "Client Contract",
+            "client_purchase_order": "Client Purchase Order",
             "vendor_contract": "Vendor Contract",
             "subcontract": "Subcontract",
             "bond_insurance": "Bond / Insurance",
@@ -253,4 +254,3 @@ APPROVER_ACTIONS = frozenset({"review", "approve", "reject", "activate", "comple
 def next_status(current_status: str, action: str) -> str | None:
     """Resolve a workflow action without allowing arbitrary status writes."""
     return STATUS_TRANSITIONS.get(current_status, {}).get(action)
-

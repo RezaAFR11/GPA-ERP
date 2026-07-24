@@ -712,6 +712,69 @@ class OperationalModuleResponse(BaseModel):
     can_approve: bool
 
 
+class ClientPOLineItemInput(BaseModel):
+    sequence: int = Field(ge=1)
+    item_no: str = Field(min_length=1, max_length=30)
+    description: str = Field(min_length=1)
+    manufacturer: str | None = Field(None, max_length=120)
+    model: str | None = Field(None, max_length=120)
+    quantity: Decimal = Field(gt=Decimal("0"), decimal_places=4)
+    uom: str = Field(min_length=1, max_length=20)
+    unit_price: Decimal = Field(ge=Decimal("0"), decimal_places=2)
+    line_total: Decimal = Field(ge=Decimal("0"), decimal_places=2)
+    technical_specs: dict[str, Any] = Field(default_factory=dict)
+
+
+class ClientPOLineItemResponse(ClientPOLineItemInput, ORMBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class ClientPOPaymentTermInput(BaseModel):
+    sequence: int = Field(ge=1)
+    percentage: Decimal = Field(gt=Decimal("0"), le=Decimal("100"), decimal_places=2)
+    trigger: str = Field(min_length=1)
+    calculation_basis: str = Field(default="grand_total", pattern="^(dpp|grand_total)$")
+    dpp_amount: Decimal = Field(default=Decimal("0"), ge=Decimal("0"), decimal_places=2)
+    tax_amount: Decimal = Field(default=Decimal("0"), ge=Decimal("0"), decimal_places=2)
+    gross_amount: Decimal = Field(default=Decimal("0"), ge=Decimal("0"), decimal_places=2)
+    due_date: date | None = None
+    status: str = Field(default="planned", pattern="^(planned|invoiced|paid|cancelled)$")
+    invoice_no: str | None = Field(None, max_length=100)
+
+
+class ClientPOPaymentTermResponse(ClientPOPaymentTermInput, ORMBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class ClientPODataInput(BaseModel):
+    line_items: list[ClientPOLineItemInput] = Field(default_factory=list, max_length=500)
+    payment_terms: list[ClientPOPaymentTermInput] = Field(default_factory=list, max_length=100)
+
+
+class OperationalAttachmentResponse(ORMBase):
+    id: int
+    doc_type: str
+    title: str
+    reference_no: str | None
+    original_filename: str
+    content_type: str
+    file_size: int
+    is_confidential: bool
+    uploaded_by: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class ClientPODetailResponse(BaseModel):
+    line_items: list[ClientPOLineItemResponse]
+    payment_terms: list[ClientPOPaymentTermResponse]
+    attachments: list[OperationalAttachmentResponse]
+
+
 class OperationalRecordCreate(BaseModel):
     record_type: str = Field(min_length=1, max_length=60)
     reference_no: str | None = Field(None, max_length=100)
@@ -726,6 +789,7 @@ class OperationalRecordCreate(BaseModel):
     due_date: date | None = None
     owner_id: int | None = None
     details: dict[str, Any] = Field(default_factory=dict)
+    client_po: ClientPODataInput | None = None
 
     @field_validator("currency")
     @classmethod
@@ -747,6 +811,7 @@ class OperationalRecordUpdate(BaseModel):
     due_date: date | None = None
     owner_id: int | None = None
     details: dict[str, Any] | None = None
+    client_po: ClientPODataInput | None = None
 
     @field_validator("currency")
     @classmethod

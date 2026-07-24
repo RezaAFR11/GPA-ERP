@@ -779,6 +779,24 @@ class OperationalRecord(Base, TimestampMixin):
     owner:    Mapped["User|None"]    = relationship("User", foreign_keys=[owner_id])
     creator:  Mapped["User"]         = relationship("User", foreign_keys=[created_by])
     approver: Mapped["User|None"]    = relationship("User", foreign_keys=[approved_by])
+    client_po_line_items: Mapped[list["ClientPOLineItem"]] = relationship(
+        "ClientPOLineItem",
+        back_populates="record",
+        cascade="all, delete-orphan",
+        order_by="ClientPOLineItem.sequence",
+    )
+    client_po_payment_terms: Mapped[list["ClientPOPaymentTerm"]] = relationship(
+        "ClientPOPaymentTerm",
+        back_populates="record",
+        cascade="all, delete-orphan",
+        order_by="ClientPOPaymentTerm.sequence",
+    )
+    attachments: Mapped[list["OperationalAttachment"]] = relationship(
+        "OperationalAttachment",
+        back_populates="record",
+        cascade="all, delete-orphan",
+        order_by="OperationalAttachment.created_at",
+    )
 
     __table_args__ = (
         UniqueConstraint("module", "reference_no", name="uq_operational_record_reference"),
@@ -786,6 +804,93 @@ class OperationalRecord(Base, TimestampMixin):
         Index("ix_operational_records_project", "project_id"),
         Index("ix_operational_records_due_date", "due_date"),
         Index("ix_operational_records_owner", "owner_id"),
+    )
+
+
+class ClientPOLineItem(Base, TimestampMixin):
+    """Commercial BOQ line linked to a client purchase order record."""
+    __tablename__ = "client_po_line_items"
+
+    id:                    Mapped[int]     = mapped_column(Integer, primary_key=True)
+    operational_record_id: Mapped[int]     = mapped_column(
+        ForeignKey("operational_records.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sequence:              Mapped[int]     = mapped_column(Integer, nullable=False)
+    item_no:               Mapped[str]     = mapped_column(String(30), nullable=False)
+    description:           Mapped[str]     = mapped_column(Text, nullable=False)
+    manufacturer:          Mapped[str|None] = mapped_column(String(120), nullable=True)
+    model:                 Mapped[str|None] = mapped_column(String(120), nullable=True)
+    quantity:              Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    uom:                   Mapped[str]     = mapped_column(String(20), nullable=False)
+    unit_price:            Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    line_total:            Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    technical_specs:       Mapped[dict]    = mapped_column(JSONB, nullable=False, default=dict)
+
+    record: Mapped["OperationalRecord"] = relationship(
+        "OperationalRecord", back_populates="client_po_line_items"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("operational_record_id", "sequence", name="uq_client_po_line_sequence"),
+        UniqueConstraint("operational_record_id", "item_no", name="uq_client_po_line_item_no"),
+    )
+
+
+class ClientPOPaymentTerm(Base, TimestampMixin):
+    """Milestone-based billing schedule for a client purchase order."""
+    __tablename__ = "client_po_payment_terms"
+
+    id:                    Mapped[int]      = mapped_column(Integer, primary_key=True)
+    operational_record_id: Mapped[int]      = mapped_column(
+        ForeignKey("operational_records.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sequence:              Mapped[int]      = mapped_column(Integer, nullable=False)
+    percentage:            Mapped[Decimal]  = mapped_column(Numeric(5, 2), nullable=False)
+    trigger:               Mapped[str]      = mapped_column(Text, nullable=False)
+    calculation_basis:     Mapped[str]      = mapped_column(String(20), nullable=False, default="grand_total")
+    dpp_amount:            Mapped[Decimal]  = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    tax_amount:            Mapped[Decimal]  = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    gross_amount:          Mapped[Decimal]  = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    due_date:              Mapped[date|None] = mapped_column(Date, nullable=True)
+    status:                Mapped[str]      = mapped_column(String(20), nullable=False, default="planned")
+    invoice_no:            Mapped[str|None] = mapped_column(String(100), nullable=True)
+
+    record: Mapped["OperationalRecord"] = relationship(
+        "OperationalRecord", back_populates="client_po_payment_terms"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("operational_record_id", "sequence", name="uq_client_po_payment_sequence"),
+        Index("ix_client_po_payment_status", "status"),
+    )
+
+
+class OperationalAttachment(Base, TimestampMixin):
+    """Protected source document attached to an operational record."""
+    __tablename__ = "operational_attachments"
+
+    id:                    Mapped[int]      = mapped_column(Integer, primary_key=True)
+    operational_record_id: Mapped[int]      = mapped_column(
+        ForeignKey("operational_records.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    doc_type:              Mapped[str]      = mapped_column(String(50), nullable=False, default="supporting_document")
+    title:                 Mapped[str]      = mapped_column(String(255), nullable=False)
+    reference_no:          Mapped[str|None] = mapped_column(String(100), nullable=True)
+    original_filename:     Mapped[str]      = mapped_column(String(255), nullable=False)
+    stored_filename:       Mapped[str]      = mapped_column(String(255), nullable=False)
+    file_path:             Mapped[str]      = mapped_column(String(2048), nullable=False)
+    content_type:          Mapped[str]      = mapped_column(String(100), nullable=False)
+    file_size:             Mapped[int]      = mapped_column(Integer, nullable=False)
+    is_confidential:       Mapped[bool]     = mapped_column(Boolean, nullable=False, default=True)
+    uploaded_by:           Mapped[int]      = mapped_column(ForeignKey("users.id"), nullable=False)
+
+    record: Mapped["OperationalRecord"] = relationship(
+        "OperationalRecord", back_populates="attachments"
+    )
+    uploader: Mapped["User"] = relationship("User", foreign_keys=[uploaded_by])
+
+    __table_args__ = (
+        Index("ix_operational_attachments_record_type", "operational_record_id", "doc_type"),
     )
 
 
