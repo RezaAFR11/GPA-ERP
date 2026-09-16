@@ -23,7 +23,7 @@ from app.menu_permissions import require_menu_access
 from app.hris_time import (
     MAX_BROWSER_TIMEZONE_OFFSET,
     MIN_BROWSER_TIMEZONE_OFFSET,
-    local_date_for_employee,
+    local_date_from_browser_offset,
 )
 from app.models import (
     AttendanceRecord, Employee,
@@ -226,7 +226,9 @@ def my_attendance(
     ),
 ) -> dict:
     emp = _my_employee(cu, db)
-    today = local_date_for_employee(emp, timezone_offset_minutes)
+    # Employee location assignments no longer restrict attendance. Follow the
+    # current browser zone for the portal's default month/day while travelling.
+    today = local_date_from_browser_offset(timezone_offset_minutes)
     y = year  or today.year
     m = month or today.month
 

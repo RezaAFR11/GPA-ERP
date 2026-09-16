@@ -13,6 +13,7 @@ from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -181,13 +182,25 @@ async def clock_in(
     if selfie is None:
         raise HTTPException(422, "A selfie is required for mobile clock-in")
 
-    today      = local_date_for_employee(emp, timezone_offset_minutes)
+    # Every employee may clock in within any active workplace geofence.
+    if not db.query(WorkLocation.id).filter(WorkLocation.is_active.is_(True)).first():
+        raise HTTPException(409, "Absen gagal karena belum ada lokasi kerja aktif. Hubungi HR untuk mengatur lokasi HO atau site.")
+    ok, matched_loc, dist = _check_location(db, latitude, longitude)
+    if not ok or matched_loc is None:
+        raise HTTPException(
+            422,
+            "Absen gagal karena Anda berada di luar jangkauan radius lokasi kerja (HO/site). "
+            "Silakan masuk ke area kerja yang terdaftar lalu ambil ulang lokasi GPS.",
+        )
+
     now        = datetime.now(timezone.utc)
+    # Use the workplace actually visited, rather than a previous assignment.
+    today      = now.astimezone(ZoneInfo(matched_loc.timezone_name)).date()
     face_detected: bool             = False
     face_confidence: Decimal | None = None
     selfie_url: str | None          = None
-    location_ok: bool | None        = None
-    location_distance_m: Decimal | None = None
+    location_ok = True
+    location_distance_m = Decimal(str(round(dist, 1)))
 
     open_record = (
         db.query(AttendanceRecord)
@@ -213,21 +226,6 @@ async def clock_in(
     ).first()
     if record and record.clock_out:
         raise HTTPException(409, "Attendance for today is already completed")
-
-    # Mobile attendance requires an active assigned work location and geofence.
-    assigned_wl: WorkLocation | None = emp.work_location if emp.work_location_id else None
-    if assigned_wl is None or not assigned_wl.is_active:
-        raise HTTPException(409, "An active work location must be assigned before mobile clock-in")
-    matched_loc: WorkLocation | None = None
-    ok, matched_loc, dist = _check_location(db, latitude, longitude, assigned_wl)
-    location_ok = ok
-    location_distance_m = Decimal(str(round(dist, 1)))
-    if not ok:
-        raise HTTPException(
-            422,
-            f"Clock-in is outside {assigned_wl.name} geofence "
-            f"({dist:.0f} m; allowed radius {assigned_wl.radius_meters} m)",
-        )
 
     # Process selfie — detect whether a face is present (no identity matching)
     if selfie:
@@ -608,7 +606,7 @@ def export_attendance(
     emp_ids = {r.employee_id for r in records}
     emp_map = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()}
     wl_map: dict[int, WorkLocation] = {}
-    wl_ids = {e.work_location_id for e in emp_map.values() if e.work_location_id}
+    wl_ids = {r.matched_work_location_id for r in records if r.matched_work_location_id}
     if wl_ids:
         wl_map = {w.id: w for w in db.query(WorkLocation).filter(WorkLocation.id.in_(wl_ids)).all()}
 
@@ -638,7 +636,7 @@ def export_attendance(
     for r in records:
         emp = emp_map.get(r.employee_id)
         dept_name = emp.department.name if emp and emp.department else ""
-        wl = wl_map.get(emp.work_location_id) if emp and emp.work_location_id else None
+        wl = wl_map.get(r.matched_work_location_id)
         ot_total = sum(
             float(x or 0) for x in [
                 r.hours_overtime_weekday,
