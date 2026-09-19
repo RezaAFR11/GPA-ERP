@@ -8,18 +8,36 @@
 - Template menentukan jam masuk lokal, awal istirahat, toleransi terlambat dan
   menit pengingat. Durasi masuk-pulang 9 jam, istirahat 1 jam, kerja 8 jam.
   Jam pulang dihitung otomatis, termasuk pergantian tanggal.
-- HR memilih karyawan atau grup, lokasi penugasan, periode dan hari berulang.
-  Jadwal disimpan per tanggal mulai shift. Maksimal satu shift per karyawan per
-  tanggal; shift yang tumpang tindih ditolak. Maksimal 366 hari / 5000 penugasan
-  per pengiriman. Rotasi dilakukan dengan periode terpisah. Keanggotaan grup
-  disalin saat penugasan, bukan berubah diam-diam jika grup berubah kemudian.
-- Jadwal hanya dapat diubah sebelum mulai dan sebelum ada catatan absensi.
-  Template yang diedit tidak mengubah jadwal lama; tetapkan ulang jadwal masa
-  depan dengan opsi ganti. Snapshot di absensi tetap menjaga riwayat.
+- HR memilih karyawan atau grup, shift, lokasi dan hari kerja. Jadwal mingguan
+  berulang tanpa tanggal akhir, sampai diubah atau dinonaktifkan. Tidak ada kolom
+  Mulai/Sampai atau centang ganti. Maksimal 500 karyawan sekali pengiriman.
+  Keanggotaan grup disalin saat penugasan; anggota baru perlu ditetapkan jadwalnya.
+- Menyimpan langsung mengganti aturan mingguan dan tanggal mendatang yang belum
+  memiliki absensi, termasuk menghapus jadwal pada hari yang tidak lagi dipilih.
+  Hari ini boleh dijadwalkan walaupun jam masuk sudah lewat, selama belum absen.
+  Jika shift sudah berakhir, jadwal dipakai pada hari kerja berikutnya.
+  Keterlambatan tetap dihitung dari jam masuk, tanpa pengecualian otomatis.
+- Sesi yang sudah memiliki absensi tetap memakai snapshot lama. Perubahan pada
+  hari yang sudah digunakan berlaku mulai hari berikutnya. Jadwal yang beririsan
+  dengan sesi lama dilewati, termasuk perubahan setelah shift lintas tengah malam.
+- Template yang diedit tidak mengubah jadwal karyawan secara diam-diam; tetapkan
+  ulang agar aturan baru digunakan. Tombol Nonaktifkan menghentikan pengulangan
+  dan membersihkan tanggal mendatang yang belum digunakan, tanpa menghapus absensi.
+- Aturan mingguan disimpan permanen. Tanggal kerja dibuat otomatis untuk jendela
+  32 hari berikutnya saat portal dibuka atau saat clock-in, menggunakan waktu
+  server dan zona penugasan. Jendela ini selalu diperpanjang sesuai kebutuhan,
+  bukan batas berakhirnya jadwal. Employee row lock mencegah penugasan/clock-in
+  bersamaan menghasilkan tanggal ganda.
+- Jadwal per tanggal dari versi sebelumnya tetap berlaku sampai HR menggantinya
+  dengan jadwal mingguan. Migrasi tidak menebak pola mingguan dari jadwal lama.
+  Rotasi otomatis dan penugasan sementara belum ditambahkan ke form mingguan.
+- Pop-up di tengah layar membedakan keberhasilan simpan template, tetapkan jadwal,
+  dan nonaktifkan jadwal; kegagalan menampilkan penyebab. Daftar diperbarui sesudah
+  respons berhasil, dan hasil penugasan menjelaskan jumlah karyawan/sesi terlindungi.
 - Absen masuk dibuka 2 jam sebelum mulai hingga sebelum akhir shift. Karyawan
   tidak memilih shift. Tidak ada jadwal berarti clock-in ditolak dengan pesan HR.
 - Zona waktu berasal dari lokasi penugasan: Asia/Jakarta, Asia/Makassar atau
-  Asia/Jayapura. Perjalanan dinas perlu penugasan sementara dari HR. Radius
+  Asia/Jayapura. Perjalanan dinas perlu perubahan penugasan oleh HR. Radius
   tetap menerima semua lokasi kerja aktif; GPS tidak mengubah jadwal yang sudah
   ditetapkan. Waktu perangkat bukan sumber perhitungan keterlambatan.
 - Selisih jam masuk dan kelebihan toleransi disimpan terpisah, dibulatkan ke atas
@@ -45,7 +63,7 @@
 
 1. Deploy backend dengan dependency baru dan jalankan `alembic upgrade head`
    melalui alur migrasi deployment yang sudah ada. Migrasi terbaru:
-   `l9a6b7c8d9e0`. Tidak mengubah isi absensi historis.
+   `m0b7c8d9e0f1` (setelah `l9a6b7c8d9e0`). Tidak mengubah isi absensi historis.
 2. Jalankan `python scripts/generate_web_push_keys.py` satu kali di lingkungan
    tepercaya. Simpan `WEB_PUSH_PRIVATE_KEY`, `WEB_PUSH_PUBLIC_KEY`, serta
    `WEB_PUSH_SUBJECT=mailto:<email-administrator>` sebagai variabel backend.

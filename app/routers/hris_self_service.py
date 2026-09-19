@@ -310,7 +310,7 @@ def my_attendance(
         for r in records
     )
 
-    return {
+    result = {
         "year":        y,
         "month":       m,
         "employee_id": emp.id,
@@ -326,6 +326,8 @@ def my_attendance(
         },
         "records": [_fmt(r) for r in records],
     }
+    db.commit()
+    return result
 
 
 # ─── My Leave ─────────────────────────────────────────────────────────────────

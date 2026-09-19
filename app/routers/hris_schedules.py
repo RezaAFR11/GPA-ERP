@@ -1,5 +1,6 @@
 """Shift setup and clarification permissions deliberately exclude inherited roles."""
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.encoders import jsonable_encoder
@@ -10,10 +11,10 @@ from app.audit import write_audit
 from app.database import get_db
 from app.dependencies import CurrentUser
 from app.hris_access import ensure_employee_can_use_self_service
-from app.hris_schedule_service import snapshot, current_assignment, close_due_for_employee, apply_hours
+from app.hris_schedule_service import snapshot, current_assignment, close_due_for_employee, apply_hours, ensure_weekly_assignments
 from app.models import (WorkShift, ShiftAssignment, WorkLocation, Employee, AttendanceRecord,
     AttendanceClarification, RoleName, AuditLog, OvertimeRequest, OvertimeRequestStatus,
-    PayrollPeriod, PayrollStatus)
+    PayrollPeriod, PayrollStatus, WeeklySchedule)
 from app.notify import push
 
 router = APIRouter(prefix="/hris/scheduling", tags=["HRIS schedules"])
@@ -56,6 +57,93 @@ class AssignmentInput(BaseModel):
     end_date: date
     weekdays: list[int] = Field(min_length=1, max_length=7)
     replace_existing: bool = False
+
+
+class WeeklyScheduleInput(BaseModel):
+    employee_ids: list[int] = Field(default_factory=list, max_length=500)
+    work_group_id: int | None = None
+    shift_id: int
+    work_location_id: int
+    weekdays: list[int] = Field(min_length=1, max_length=7)
+
+
+def clear_unused_schedules(db, emp_id, now):
+    """Replace only unconsumed current/future dates; used snapshots are immutable."""
+    records = db.query(AttendanceRecord).filter(AttendanceRecord.employee_id == emp_id).all()
+    protected = {r.date for r in records}
+    for row in db.query(ShiftAssignment).filter(ShiftAssignment.employee_id == emp_id,
+        ShiftAssignment.date >= (now - timedelta(days=1)).date()).all():
+        local_today = now.astimezone(ZoneInfo(row.snapshot["timezone"])).date()
+        if row.date >= local_today and row.date not in protected:
+            db.delete(row)
+    db.flush()
+    return records
+
+
+@router.get("/weekly-schedules")
+def weekly_schedules(cu: CurrentUser, db: DB):
+    manager(cu)
+    return [{**model_to_dict(r), "employee_name": r.employee.full_name}
+            for r in db.query(WeeklySchedule).order_by(WeeklySchedule.employee_id)]
+
+
+@router.post("/weekly-schedules")
+def set_weekly_schedule(payload: WeeklyScheduleInput, cu: CurrentUser, db: DB):
+    manager(cu)
+    if any(day not in range(7) for day in payload.weekdays):
+        raise HTTPException(422, "Pilih hari kerja yang valid.")
+    shift, loc = db.get(WorkShift, payload.shift_id), db.get(WorkLocation, payload.work_location_id)
+    if not shift or not shift.is_active or not loc or not loc.is_active:
+        raise HTTPException(422, "Pilih shift dan lokasi kerja yang aktif.")
+    ids = set(payload.employee_ids)
+    if payload.work_group_id:
+        ids.update(r[0] for r in db.query(Employee.id).filter(Employee.work_group_id == payload.work_group_id))
+    if not ids or len(ids) > 500:
+        raise HTTPException(422, "Pilih 1 hingga 500 karyawan.")
+    employees = db.query(Employee).filter(Employee.id.in_(ids)).order_by(Employee.id).with_for_update().all()
+    if len(employees) != len(ids):
+        raise HTTPException(422, "Karyawan tidak ditemukan.")
+    now = datetime.now(timezone.utc)
+    today = now.astimezone(ZoneInfo(loc.timezone_name)).date()
+    preserved = 0
+    for emp in employees:
+        ensure_employee_can_use_self_service(emp)
+        row = db.query(WeeklySchedule).filter(WeeklySchedule.employee_id == emp.id).first()
+        before = model_to_dict(row) if row else None
+        records = clear_unused_schedules(db, emp.id, now)
+        has_today = any(r.date == today for r in records)
+        if has_today or any(r.clock_in and not r.clock_out and not r.auto_closed_at for r in records):
+            preserved += 1
+        if not row:
+            row = WeeklySchedule(employee_id=emp.id)
+            db.add(row)
+        row.shift_id, row.work_location_id = shift.id, loc.id
+        row.weekdays = sorted(set(payload.weekdays))
+        row.snapshot = snapshot(shift, loc, today)
+        row.effective_from = today + timedelta(days=1) if has_today else today
+        row.is_active = True
+        db.flush()
+        ensure_weekly_assignments(db, emp.id, now)
+        write_audit(db, "WeeklySchedule", row.id, "UPDATE" if before else "CREATE", changed_by=cu.id,
+                    before=before, after=model_to_dict(row))
+    db.commit()
+    return {"assigned": len(employees), "preserved_sessions": preserved}
+
+
+@router.delete("/weekly-schedules/{schedule_id}")
+def deactivate_weekly_schedule(schedule_id: int, cu: CurrentUser, db: DB):
+    manager(cu)
+    row = db.get(WeeklySchedule, schedule_id)
+    if not row:
+        raise HTTPException(404, "Jadwal tidak ditemukan.")
+    db.query(Employee).filter(Employee.id == row.employee_id).with_for_update().one()
+    db.refresh(row)
+    before = model_to_dict(row)
+    clear_unused_schedules(db, row.employee_id, datetime.now(timezone.utc))
+    row.is_active = False
+    write_audit(db, "WeeklySchedule", row.id, "DEACTIVATE", changed_by=cu.id, before=before, after=model_to_dict(row))
+    db.commit()
+    return {"message": "Jadwal dinonaktifkan. Sesi yang sudah absen tetap tersimpan."}
 
 
 @router.get("/shifts")
@@ -114,6 +202,8 @@ def assign(payload: AssignmentInput, cu: CurrentUser, db: DB):
     count = 0
     for emp in employees:
         ensure_employee_can_use_self_service(emp)
+        if db.query(WeeklySchedule.id).filter(WeeklySchedule.employee_id == emp.id, WeeklySchedule.is_active.is_(True)).first():
+            raise HTTPException(409, "Karyawan memiliki jadwal mingguan aktif. Ubah melalui pengaturan jadwal mingguan.")
         for offset in range((payload.end_date - payload.start_date).days + 1):
             day = payload.start_date + timedelta(days=offset)
             if day.weekday() not in payload.weekdays:
@@ -164,6 +254,8 @@ def cancel(assignment_id: int, cu: CurrentUser, db: DB):
     if not row:
         raise HTTPException(404, "Schedule not found")
     db.query(Employee).filter(Employee.id == row.employee_id).with_for_update().first()
+    if row.snapshot.get("weekly_schedule_id"):
+        raise HTTPException(409, "Ubah atau nonaktifkan jadwal melalui pengaturan jadwal mingguan.")
     if row.starts_at <= datetime.now(timezone.utc) or db.query(AttendanceRecord.id).filter(
         AttendanceRecord.employee_id == row.employee_id, AttendanceRecord.date == row.date).first():
         raise HTTPException(409, "A started schedule cannot be cancelled")
@@ -190,10 +282,12 @@ def mine(cu: CurrentUser, db: DB):
     corrections = db.query(AttendanceClarification).join(AttendanceRecord).filter(
         AttendanceRecord.employee_id == emp.id).order_by(AttendanceClarification.id.desc()).limit(100).all()
     current = open_record.schedule_snapshot if open_record and open_record.schedule_snapshot else (selected.snapshot if selected else None)
-    return {"current": current,
+    result = {"current": current,
             "upcoming": [r.snapshot for r in upcoming],
             "unresolved": [model_to_dict(r) for r in unresolved],
             "clarifications": [model_to_dict(r) for r in corrections]}
+    db.commit()
+    return result
 
 
 class ClarificationInput(BaseModel):
@@ -283,4 +377,4 @@ def review(clarification_id: int, payload: ReviewInput, cu: CurrentUser, db: DB)
 def history(cu: CurrentUser, db: DB):
     manager(cu)
     return [model_to_dict(r) for r in db.query(AuditLog).filter(AuditLog.entity_type.in_(
-        ["WorkShift", "ShiftAssignment", "AttendanceClarification", "AttendanceRecord", "WorkLocation"])).order_by(AuditLog.id.desc()).limit(200)]
+        ["WorkShift", "ShiftAssignment", "WeeklySchedule", "AttendanceClarification", "AttendanceRecord", "WorkLocation"])).order_by(AuditLog.id.desc()).limit(200)]

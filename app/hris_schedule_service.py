@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.audit import write_audit
-from app.models import AttendanceRecord, ShiftAssignment, WorkShift, WorkLocation
+from app.models import AttendanceRecord, ShiftAssignment, WorkShift, WorkLocation, WeeklySchedule, Employee
 from app.notify import push
 
 AUTO_CLOSE_HOURS = 5
@@ -32,12 +32,66 @@ def snapshot(shift: WorkShift, location: WorkLocation, day: date) -> dict:
 
 
 def current_assignment(db: Session, employee_id: int, now: datetime):
+    ensure_weekly_assignments(db, employee_id, now)
     # Allow clock-in up to two hours early. Never infer a shift from the phone.
     return db.query(ShiftAssignment).filter(
         ShiftAssignment.employee_id == employee_id,
         ShiftAssignment.starts_at <= now + timedelta(hours=2),
         ShiftAssignment.ends_at > now,
     ).order_by(ShiftAssignment.starts_at).first()
+
+
+def weekly_snapshot(rule: WeeklySchedule, day: date) -> dict:
+    """Rebase frozen local shift rules to a date, keeping overnight boundaries."""
+    data = dict(rule.snapshot)
+    zone = ZoneInfo(data["timezone"])
+    original = datetime.fromisoformat(data["starts_at"]).astimezone(zone)
+    start = datetime.combine(day, original.time().replace(tzinfo=None), zone)
+    for key in ("starts_at", "ends_at", "break_starts_at", "break_ends_at"):
+        offset = datetime.fromisoformat(data[key]).astimezone(zone) - original
+        data[key] = (start + offset).astimezone(timezone.utc).isoformat()
+    data["date"] = day.isoformat()
+    data["weekly_schedule_id"] = rule.id
+    return data
+
+
+def ensure_weekly_assignments(db: Session, employee_id: int, now: datetime):
+    # Use the same employee lock as HR changes and clock-in; no duplicate dates
+    # when portal requests and clock-in arrive together. Caller owns the commit.
+    db.query(Employee).filter(Employee.id == employee_id).with_for_update().first()
+    rule = db.query(WeeklySchedule).filter(WeeklySchedule.employee_id == employee_id,
+        WeeklySchedule.is_active.is_(True)).first()
+    if not rule:
+        return
+    today = now.astimezone(ZoneInfo(rule.snapshot["timezone"])).date()
+    first = max(rule.effective_from, today - timedelta(days=1))
+    last = today + timedelta(days=32)
+    rows = db.query(ShiftAssignment).filter(ShiftAssignment.employee_id == employee_id,
+        ShiftAssignment.date.between(first - timedelta(days=1), last + timedelta(days=1))).all()
+    occupied_dates = {r.date for r in rows}
+    attended = db.query(AttendanceRecord).filter(AttendanceRecord.employee_id == employee_id,
+        AttendanceRecord.date.between(first - timedelta(days=1), last + timedelta(days=1))).all()
+    occupied_dates.update(r.date for r in attended)
+    spans = [(r.starts_at, r.ends_at) for r in rows]
+    for r in attended:
+        if r.schedule_snapshot:
+            spans.append((datetime.fromisoformat(r.schedule_snapshot["starts_at"]),
+                          datetime.fromisoformat(r.schedule_snapshot["ends_at"])))
+        elif r.clock_in:
+            spans.append((r.clock_in, r.clock_out or now))
+    for offset in range(max(0, (last - first).days + 1)):
+        day = first + timedelta(days=offset)
+        if day.weekday() not in rule.weekdays or day in occupied_dates:
+            continue
+        data = weekly_snapshot(rule, day)
+        start, end = datetime.fromisoformat(data["starts_at"]), datetime.fromisoformat(data["ends_at"])
+        if end <= now or any(a < end and b > start for a, b in spans):
+            continue
+        db.add(ShiftAssignment(employee_id=employee_id, shift_id=rule.shift_id,
+            work_location_id=rule.work_location_id, date=day, snapshot=data,
+            starts_at=start, ends_at=end))
+        spans.append((start, end))
+    db.flush()
 
 
 def attach_schedule(record: AttendanceRecord, assignment: ShiftAssignment, now: datetime):

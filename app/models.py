@@ -1793,6 +1793,19 @@ class ShiftAssignment(Base, TimestampMixin):
     __table_args__ = (UniqueConstraint("employee_id", "date", name="uq_shift_employee_date"),)
 
 
+class WeeklySchedule(Base, TimestampMixin):
+    __tablename__ = "hris_weekly_schedules"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("hris_employees.id"), nullable=False, unique=True)
+    shift_id: Mapped[int] = mapped_column(ForeignKey("hris_work_shifts.id"), nullable=False)
+    work_location_id: Mapped[int] = mapped_column(ForeignKey("hris_work_locations.id"), nullable=False)
+    weekdays: Mapped[list] = mapped_column(JSONB, nullable=False)
+    snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    effective_from: Mapped[date] = mapped_column(Date, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    employee: Mapped["Employee"] = relationship("Employee")
+
+
 class AttendanceClarification(Base, TimestampMixin):
     __tablename__ = "hris_attendance_clarifications"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
