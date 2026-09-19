@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # Uploads
     UPLOAD_DIR: str = "./uploads"
     MAX_UPLOAD_MB: int = 10
+    WEB_PUSH_PUBLIC_KEY: str = ""
+    WEB_PUSH_PRIVATE_KEY: str = ""
+    WEB_PUSH_SUBJECT: str = ""
 
     # Statutory payroll parameters. BPJS updates the JP ceiling periodically.
     BPJS_JP_SALARY_CEILING: Decimal = Decimal("10547400")

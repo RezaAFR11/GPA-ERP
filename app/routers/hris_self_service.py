@@ -226,9 +226,19 @@ def my_attendance(
     ),
 ) -> dict:
     emp = _my_employee(cu, db)
-    # Employee location assignments no longer restrict attendance. Follow the
-    # current browser zone for the portal's default month/day while travelling.
-    today = local_date_from_browser_offset(timezone_offset_minutes)
+    from app.hris_schedule_service import current_assignment, close_due_for_employee
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    now = datetime.now(timezone.utc)
+    close_due_for_employee(db, emp.id, now)
+    db.commit()
+    schedule = current_assignment(db, emp.id, now)
+    from app.models import ShiftAssignment
+    latest_schedule = schedule or db.query(ShiftAssignment).filter(
+        ShiftAssignment.employee_id == emp.id, ShiftAssignment.starts_at <= now
+    ).order_by(ShiftAssignment.starts_at.desc()).first()
+    local_zone = latest_schedule.snapshot["timezone"] if latest_schedule else "Asia/Jakarta"
+    today = schedule.date if schedule else now.astimezone(ZoneInfo(local_zone)).date()
     y = year  or today.year
     m = month or today.month
 
@@ -257,6 +267,7 @@ def my_attendance(
             AttendanceRecord.employee_id == emp.id,
             AttendanceRecord.clock_in.isnot(None),
             AttendanceRecord.clock_out.is_(None),
+            AttendanceRecord.auto_closed_at.is_(None),
         )
         .order_by(AttendanceRecord.date.desc())
         .first()
@@ -266,6 +277,12 @@ def my_attendance(
     def _fmt(r: AttendanceRecord) -> dict:
         return {
             "id":                       r.id,
+            "schedule_snapshot":        r.schedule_snapshot,
+            "auto_close_at":            r.auto_close_at,
+            "auto_closed_at":           r.auto_closed_at,
+            "clarification_status":     r.clarification_status,
+            "late_minutes":             r.late_minutes,
+            "beyond_grace_minutes":      r.beyond_grace_minutes,
             "date":                     r.date.isoformat(),
             "clock_in":                 r.clock_in.isoformat() if r.clock_in else None,
             "clock_out":                r.clock_out.isoformat() if r.clock_out else None,
@@ -300,7 +317,7 @@ def my_attendance(
         "today": _fmt(active_rec) if active_rec else None,
         "clock_state": (
             "clocked_in"   if open_rec else
-            "clocked_out"  if today_rec and today_rec.clock_out else
+            "clocked_out"  if today_rec and (today_rec.clock_out or today_rec.auto_closed_at) else
             "not_clocked_in"
         ),
         "summary": {

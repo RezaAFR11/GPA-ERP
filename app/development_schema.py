@@ -27,6 +27,22 @@ def _ensure_incremental_schema():
             ac.execute(text(f"ALTER TYPE rolename ADD VALUE IF NOT EXISTS '{_role_val}'"))
 
     with engine.begin() as conn:
+        if "hris_attendance_records" in table_names:
+            cols = {c["name"] for c in inspector.get_columns("hris_attendance_records")}
+            additions = {
+                "schedule_snapshot": "JSONB",
+                "auto_close_at": "TIMESTAMP WITH TIME ZONE",
+                "auto_closed_at": "TIMESTAMP WITH TIME ZONE",
+                "reminder_at": "TIMESTAMP WITH TIME ZONE",
+                "reminder_sent_at": "TIMESTAMP WITH TIME ZONE",
+                "late_minutes": "INTEGER NOT NULL DEFAULT 0",
+                "beyond_grace_minutes": "INTEGER NOT NULL DEFAULT 0",
+                "clarification_status": "VARCHAR(20)",
+            }
+            for name, ddl in additions.items():
+                if name not in cols:
+                    conn.execute(text(f"ALTER TABLE hris_attendance_records ADD COLUMN {name} {ddl}"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_hris_attendance_records_auto_close_at ON hris_attendance_records (auto_close_at)"))
         if "users" in table_names:
             cols = {c["name"] for c in inspector.get_columns("users")}
             if "must_change_password" not in cols:

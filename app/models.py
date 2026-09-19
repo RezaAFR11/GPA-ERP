@@ -1244,6 +1244,14 @@ class AttendanceRecord(Base, TimestampMixin):
     face_confidence:        Mapped[Decimal|None]     = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
     note:                   Mapped[str|None]         = mapped_column(Text, nullable=True)
     matched_work_location_id: Mapped[int|None] = mapped_column(ForeignKey("hris_work_locations.id"), nullable=True)
+    schedule_snapshot: Mapped[dict|None] = mapped_column(JSONB, nullable=True)
+    auto_close_at: Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    auto_closed_at: Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reminder_at: Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reminder_sent_at: Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
+    late_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    beyond_grace_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    clarification_status: Mapped[str|None] = mapped_column(String(20), nullable=True)
 
     employee: Mapped["Employee"] = relationship("Employee", foreign_keys=[employee_id])
     matched_work_location: Mapped["WorkLocation|None"] = relationship("WorkLocation", foreign_keys=[matched_work_location_id])
@@ -1758,3 +1766,62 @@ class EmployeeDataChangeRequest(Base, TimestampMixin):
 
     def __repr__(self) -> str:
         return f"<DataChangeRequest emp={self.employee_id} field={self.field_name} {self.status}>"
+
+
+class WorkShift(Base, TimestampMixin):
+    __tablename__ = "hris_work_shifts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    start_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    break_start_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=240)
+    grace_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
+    reminder_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class ShiftAssignment(Base, TimestampMixin):
+    __tablename__ = "hris_shift_assignments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("hris_employees.id"), nullable=False, index=True)
+    shift_id: Mapped[int] = mapped_column(ForeignKey("hris_work_shifts.id"), nullable=False)
+    work_location_id: Mapped[int] = mapped_column(ForeignKey("hris_work_locations.id"), nullable=False)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    employee: Mapped["Employee"] = relationship("Employee")
+    __table_args__ = (UniqueConstraint("employee_id", "date", name="uq_shift_employee_date"),)
+
+
+class AttendanceClarification(Base, TimestampMixin):
+    __tablename__ = "hris_attendance_clarifications"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attendance_id: Mapped[int] = mapped_column(ForeignKey("hris_attendance_records.id"), nullable=False, index=True)
+    reason: Mapped[str] = mapped_column(String(20), nullable=False)
+    actual_clock_out: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    reviewed_by: Mapped[int|None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime|None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_note: Mapped[str|None] = mapped_column(Text, nullable=True)
+    attendance: Mapped["AttendanceRecord"] = relationship("AttendanceRecord")
+
+
+class BrowserPushSubscription(Base, TimestampMixin):
+    __tablename__ = "browser_push_subscriptions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    keys: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+
+class AttendancePushDelivery(Base, TimestampMixin):
+    __tablename__ = "attendance_push_deliveries"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attendance_id: Mapped[int] = mapped_column(ForeignKey("hris_attendance_records.id"), nullable=False)
+    subscription_id: Mapped[int] = mapped_column(ForeignKey("browser_push_subscriptions.id", ondelete="CASCADE"), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (UniqueConstraint("attendance_id", "subscription_id", name="uq_attendance_push_subscription"),)

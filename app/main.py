@@ -34,11 +34,14 @@ async def lifespan(app: FastAPI):
     from app.notify import run_email_outbox_worker
     email_worker_stop = asyncio.Event()
     email_worker = asyncio.create_task(run_email_outbox_worker(email_worker_stop))
+    from app.attendance_worker import run_attendance_worker
+    attendance_worker = asyncio.create_task(run_attendance_worker(email_worker_stop))
     try:
         yield
     finally:
         email_worker_stop.set()
         await email_worker
+        await attendance_worker
 
 
 app = FastAPI(
@@ -133,6 +136,9 @@ app.include_router(hris_employees.router, prefix=API_PREFIX,
 # Attendance, leave, overtime, and HRIS-setting endpoints share one router but
 # enforce their own menu dependency at endpoint level.
 app.include_router(hris_attendance.router, prefix=API_PREFIX)
+from app.routers import hris_schedules, browser_push
+app.include_router(hris_schedules.router, prefix=API_PREFIX)
+app.include_router(browser_push.router, prefix=API_PREFIX)
 app.include_router(hris_payroll.router, prefix=API_PREFIX,
                    dependencies=[Depends(require_menu_access("hris_payroll", "hris_settings"))])
 app.include_router(hris_recruitment.router, prefix=API_PREFIX,

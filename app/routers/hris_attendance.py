@@ -27,6 +27,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.dependencies import CurrentUser, get_client_ip, require_role
 from app.hris_access import ensure_employee_can_use_self_service
+from app.hris_schedule_service import current_assignment, attach_schedule, close_due_for_employee, apply_hours
 from app.hris_attendance_service import (
     calculate_overtime as _calculate_overtime,
     check_location as _check_location,
@@ -194,8 +195,16 @@ async def clock_in(
         )
 
     now        = datetime.now(timezone.utc)
-    # Use the workplace actually visited, rather than a previous assignment.
-    today      = now.astimezone(ZoneInfo(matched_loc.timezone_name)).date()
+    # Serialise clock-in against HR schedule changes and other mobile requests.
+    db.query(Employee).filter(Employee.id == emp.id).with_for_update().one()
+    close_due_for_employee(db, emp.id, now)
+    db.commit()
+    db.query(Employee).filter(Employee.id == emp.id).with_for_update().one()
+    assignment = current_assignment(db, emp.id, now)
+    if not assignment:
+        raise HTTPException(409, "Jadwal kerja Anda belum tersedia atau di luar waktu shift. Hubungi HR. Absen masuk dibuka 2 jam sebelum shift.")
+    # The roster's local start date is stable across midnight and phone settings.
+    today = assignment.date
     face_detected: bool             = False
     face_confidence: Decimal | None = None
     selfie_url: str | None          = None
@@ -208,6 +217,7 @@ async def clock_in(
             AttendanceRecord.employee_id == emp.id,
             AttendanceRecord.clock_in.isnot(None),
             AttendanceRecord.clock_out.is_(None),
+            AttendanceRecord.auto_closed_at.is_(None),
         )
         .order_by(AttendanceRecord.date.desc())
         .first()
@@ -224,7 +234,7 @@ async def clock_in(
         AttendanceRecord.employee_id == emp.id,
         AttendanceRecord.date == today,
     ).first()
-    if record and record.clock_out:
+    if record and (record.clock_out or record.auto_closed_at):
         raise HTTPException(409, "Attendance for today is already completed")
 
     # Process selfie — detect whether a face is present (no identity matching)
@@ -285,6 +295,7 @@ async def clock_in(
         )
         db.add(record)
 
+    attach_schedule(record, assignment, now)
     db.flush()
     linked_overtime_ids = _link_overtime_requests_to_attendance(db, record)
     write_audit(db, "AttendanceRecord", record.id, "CLOCK_IN",
@@ -338,8 +349,10 @@ def clock_out(
             raise HTTPException(404, "No employee record linked to your account")
     ensure_employee_can_use_self_service(emp)
 
-    today      = local_date_for_employee(emp, timezone_offset_minutes)
     now        = datetime.now(timezone.utc)
+
+    close_due_for_employee(db, emp.id, now)
+    db.commit()
 
     record = (
         db.query(AttendanceRecord)
@@ -347,13 +360,14 @@ def clock_out(
             AttendanceRecord.employee_id == emp.id,
             AttendanceRecord.clock_in.isnot(None),
             AttendanceRecord.clock_out.is_(None),
+            AttendanceRecord.auto_closed_at.is_(None),
         )
         .order_by(AttendanceRecord.date.desc())
-        .first()
+        .with_for_update().first()
     )
 
     if not record:
-        raise HTTPException(409, "No open clock-in found")
+        raise HTTPException(409, "Tidak ada absensi terbuka. Jika ditutup otomatis, kirim klarifikasi di Absensi Saya.")
     if record.clock_out:
         raise HTTPException(409, "Already clocked out today")
 
@@ -368,6 +382,9 @@ def clock_out(
         record.hours_overtime_weekday = ot_wd
         record.hours_overtime_weekend = ot_we
         record.hours_overtime_holiday = ot_hol
+
+    if record.schedule_snapshot:
+        apply_hours(db, record, now)
 
     if note:
         record.note = note
@@ -618,16 +635,17 @@ def export_attendance(
         "Latitude", "Longitude", "Akurasi (m)",
         "Lokasi OK", "Jarak (m)",
         "Wajah Terdeteksi", "Catatan",
+        "Shift", "Zona Waktu", "Selisih Masuk (menit)", "Di Luar Toleransi (menit)", "Status Klarifikasi",
     ]
 
     client_timezone = timezone_from_browser_offset(timezone_offset_minutes)
 
-    def _fmt_time(dt: datetime | None) -> str:
+    def _fmt_time(dt: datetime | None, zone: str | None = None) -> str:
         if dt is None:
             return ""
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(client_timezone).strftime("%H:%M:%S")
+        return dt.astimezone(ZoneInfo(zone) if zone else client_timezone).strftime("%H:%M:%S")
 
     def _fmt_dec(v) -> str:
         return str(round(float(v), 2)) if v is not None else ""
@@ -650,8 +668,8 @@ def export_attendance(
             emp.full_name if emp else "",
             dept_name,
             wl.name if wl else "",
-            _fmt_time(r.clock_in),
-            _fmt_time(r.clock_out),
+            _fmt_time(r.clock_in, (r.schedule_snapshot or {}).get("timezone")),
+            _fmt_time(r.clock_out, (r.schedule_snapshot or {}).get("timezone")),
             _fmt_dec(r.hours_regular),
             _fmt_dec(r.hours_overtime_weekday),
             _fmt_dec(r.hours_overtime_weekend),
@@ -665,6 +683,9 @@ def export_attendance(
             _fmt_dec(r.location_distance_m),
             "Ya" if r.face_verified else "Tidak",
             r.note or "",
+            (r.schedule_snapshot or {}).get("shift_name", ""),
+            (r.schedule_snapshot or {}).get("timezone", ""),
+            r.late_minutes, r.beyond_grace_minutes, r.clarification_status or "",
         ])
 
     if fmt == "csv":
@@ -747,8 +768,12 @@ def create_work_location(
     current_user: Annotated[CurrentUser, Depends(require_role(*_wl_roles))],
     db:           Annotated[Session, Depends(get_db)],
 ):
+    if current_user.role.name not in (RoleName.SUPER_ADMIN, RoleName.HR):
+        raise HTTPException(403, "Only Super Admin and HR can configure attendance locations")
     wl = WorkLocation(**payload.model_dump())
     db.add(wl)
+    db.flush()
+    write_audit(db, "WorkLocation", wl.id, "CREATE", changed_by=current_user.id, after=model_to_dict(wl))
     db.commit()
     db.refresh(wl)
     return wl
@@ -763,11 +788,15 @@ def update_work_location(
     current_user: Annotated[CurrentUser, Depends(require_role(*_wl_roles))],
     db:           Annotated[Session, Depends(get_db)],
 ):
+    if current_user.role.name not in (RoleName.SUPER_ADMIN, RoleName.HR):
+        raise HTTPException(403, "Only Super Admin and HR can configure attendance locations")
     wl = db.query(WorkLocation).filter(WorkLocation.id == wl_id).first()
     if not wl:
         raise HTTPException(404, "Work location not found")
+    before = model_to_dict(wl)
     for field, val in payload.model_dump(exclude_unset=True).items():
         setattr(wl, field, val)
+    write_audit(db, "WorkLocation", wl.id, "UPDATE", changed_by=current_user.id, before=before, after=model_to_dict(wl))
     db.commit()
     db.refresh(wl)
     return wl
@@ -783,6 +812,8 @@ def assign_employee_work_location(
     db:               Annotated[Session, Depends(get_db)],
     work_location_id: int | None = Query(None, description="Pass null to clear assignment"),
 ):
+    if current_user.role.name not in (RoleName.SUPER_ADMIN, RoleName.HR):
+        raise HTTPException(403, "Only Super Admin and HR can configure attendance locations")
     emp = db.query(Employee).filter(Employee.id == employee_id).first()
     if not emp:
         raise HTTPException(404, "Employee not found")

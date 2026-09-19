@@ -1093,6 +1093,12 @@ class WorkGroupResponse(ORMBase):
 # ─── Attendance ──────────────────────────────────────────────────────────────
 
 class AttendanceRecordResponse(ORMBase):
+    schedule_snapshot: dict | None = None
+    auto_close_at: datetime | None = None
+    auto_closed_at: datetime | None = None
+    clarification_status: str | None = None
+    late_minutes: int = 0
+    beyond_grace_minutes: int = 0
     id:                     int
     employee_id:            int
     date:                   date
